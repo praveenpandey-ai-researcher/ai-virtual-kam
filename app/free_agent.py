@@ -59,7 +59,22 @@ def _fallback_prompt(prompt: str) -> str:
 - HARD LIMIT: at most two sentences and about 35 words per reply. Never give two recommendations
   in one reply; give one, then stop and let the seller respond.
 - Call `show_call_summary` only after you have given all the recommendations and the seller has
-  agreed. Do not announce it."""
+  agreed. Do not announce it.
+
+# Language: match the seller
+- Reply in the language of the seller's most recent message. English gets English.
+- If the seller speaks Hindi or Hinglish (in Devanagari or in Roman letters), reply in natural,
+  friendly Hinglish, the way an Indian account manager really talks: Hindi sentences with the
+  business words kept in English (sales, orders, stock, out of stock, restock, cancellation,
+  listing, price, promotion, visibility, best-seller) and product names in English.
+- You are a woman: in Hindi always use feminine verb forms for yourself ("मैं देखती हूँ",
+  "समझ गई", "बताती हूँ", "करूँगी"), never masculine ones ("देखता हूँ", "समझ गया", "करूँगा").
+- Keep it everyday and simple, not formal or bookish Hindi. Say "cancellation" not "रद्दीकरण",
+  "supply" not "आपूर्ति", "problem" not "समस्या", "sales" not "बिक्री". Example of the right tone:
+  "आपके orders कम हुए हैं क्योंकि काफ़ी products out of stock हो गए थे।"
+- In Hindi, address the seller politely with "जी" and "आप", and say numbers in Hindi words
+  (for example "एक लाख पैंतीस हज़ार रुपये", "चौदह प्रतिशत").
+- Switch language whenever the seller switches. The summary shown on screen stays in English."""
 
 
 SYSTEM_PROMPT = _fallback_prompt(cfg.SYSTEM_PROMPT)
@@ -79,19 +94,92 @@ TOOLS["end_call"] = _fn("end_call", "End the call after the seller has said good
 # the call by themselves). Instead of hoping the prompt holds, the conversation stage is computed
 # in code from the history, and it decides (a) which tools the model is even offered and (b) a
 # one-line "next step" hint. The model still chooses its words and adapts to the seller.
-SUMMARY_AFTER_SELLER_TURNS = 5   # seller turns after the data is loaded before the summary tool is offered
+SUMMARY_AFTER_SELLER_TURNS = 6   # safety net: offer the summary tool by now even if a recommendation was not detected
+MAX_SENTENCES = 3                # hard cap on one spoken reply
 
-_STEPS = [
+_BEFORE_PLAN = [
     "Share the key signal (orders down, price unchanged so pricing is not the cause, out-of-stock products up) "
     "and ask ONE question about supply or restocking. Do not recommend anything yet.",
     "Ask ONE question about the rise in cancellations (were they cancelled by the seller because stock ran out?). "
     "Do not recommend anything yet.",
     "Explain in one or two sentences how the stock-outs connect the problems (fewer orders, more cancellations, "
     "likely lower visibility), then offer to go through the plan.",
-    "Give recommendation 1 ONLY (action, why, rough impact, top products by name). Then stop.",
-    "Give recommendation 2 ONLY. Then stop.",
-    "Give recommendation 3 ONLY, then ask if the seller is comfortable with the plan.",
 ]
+# How we recognise that a recommendation has been spoken (English and Hinglish, either script).
+_REC_GIVEN = [
+    re.compile(r"(restock|रीस्टॉक).*(best-?sellers?|बेस्ट|first|पहले|48|reorder|रीऑर्डर)|"
+               r"(best-?sellers?|बेस्ट).*(restock|रीस्टॉक)|reorder alert", re.IGNORECASE | re.DOTALL),
+    re.compile(r"stock counts?|स्टॉक काउंट|pause.{0,25}listing|listing.{0,25}(pause|पॉज़|पाज़|पॉज)|लिस्टिंग.{0,25}(pause|पॉज़|पाज़|पॉज)|"
+               r"small buffer|बफ़र|बफर", re.IGNORECASE | re.DOTALL),
+    re.compile(r"promotion|sponsored|sale event|प्रमोशन|स्पॉन्सर", re.IGNORECASE),
+]
+_REC_STEP = [
+    "Give recommendation 1 ONLY (restock the out-of-stock best-sellers first: name the top products, the "
+    "timeframe and the rough impact). Then stop.",
+    "Give recommendation 2 ONLY (stop cancellations at the source: update stock counts daily, pause listings at "
+    "zero stock). Then stop.",
+    "Give recommendation 3 ONLY (after restocking, a short promotion or sponsored listing to rebuild visibility), "
+    "then ask if the seller is comfortable with the plan.",
+]
+
+
+def _stage(msgs: list[dict[str, Any]]) -> tuple[bool, int, bool, list[bool]]:
+    """(data loaded?, seller turns since the data was loaded, summary shown?, which recommendations were given)"""
+    loaded, since, summary, given = False, 0, False, [False, False, False]
+    for m in msgs:
+        for tc in m.get("tool_calls") or []:
+            name = tc["function"]["name"]
+            loaded = loaded or name == "get_seller_diagnosis"
+            summary = summary or name == "show_call_summary"
+        if loaded and m["role"] == "user":
+            since += 1
+        if loaded and m["role"] == "assistant" and m.get("content"):
+            given = [g or bool(rx.search(m["content"])) for g, rx in zip(given, _REC_GIVEN)]
+    return loaded, since, summary, given
+
+
+def _seller_replied_to_summary(msgs: list[dict[str, Any]]) -> bool:
+    shown = max((i for i, m in enumerate(msgs)
+                 if any(tc["function"]["name"] == "show_call_summary" for tc in m.get("tool_calls") or [])), default=None)
+    return shown is not None and any(m["role"] == "user" for m in msgs[shown + 1:])
+
+
+def stage_tools(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    loaded, since, summary, given = _stage(msgs)
+    if seller_is_leaving(msgs):
+        return [TOOLS["end_call"]]
+    if not loaded:
+        return [TOOLS["get_seller_diagnosis"]]
+    if summary:
+        # Hanging up is offered only once the seller has answered the recap ("anything else?"),
+        # never in the same turn as the summary.
+        return [TOOLS["end_call"]] if _seller_replied_to_summary(msgs) else []
+    return [TOOLS["show_call_summary"]] if all(given) or since >= SUMMARY_AFTER_SELLER_TURNS else []
+
+
+def stage_hint(msgs: list[dict[str, Any]]) -> str | None:
+    loaded, since, summary, given = _stage(msgs)
+    if seller_is_leaving(msgs):
+        return ("The seller is ending the call. Say a warm goodbye in one short sentence (thank them by name, wish "
+                "them well; if actions were agreed, mention you will check in in seven days) and call end_call. "
+                "Do not ask another question.")
+    if not loaded:
+        return None
+    if summary and _seller_replied_to_summary(msgs):
+        step = ("If the seller has nothing more (for example they say no, that is all, or thank you), say a warm "
+                "one-sentence goodbye and call end_call. If they ask something, answer it briefly.")
+    elif summary:
+        step = ("Give a recap of two sentences at most, offer a follow-up check-in in seven days and ask if there is "
+                "anything else. Then stop and wait for the seller's answer.")
+    elif since < len(_BEFORE_PLAN) and not any(given):
+        step = _BEFORE_PLAN[since]
+    elif not all(given):
+        step = _REC_STEP[given.index(False)]
+    else:
+        step = ("All three recommendations are given. If the seller is comfortable with the plan, call the "
+                "show_call_summary tool now (do not write it as text). Otherwise answer their concern briefly.")
+    return ("Suggested next step. If the seller asked a question, disagreed or changed topic, answer that first in "
+            "one or two sentences, then continue with this step: " + step)
 
 
 # The seller can end the call at any point, not only after the summary. Detected in code from the
@@ -100,56 +188,45 @@ _FAREWELL = re.compile(
     r"\b(bye|goodbye|good bye|see you|talk (to you )?later|that'?s all|that is all|that will be all|nothing else|"
     r"no(thing)? more questions|i'?m done|i am done|have a (good|nice|great) (day|evening|night)|"
     r"(end|disconnect|hang up|cut) (the |this )?call|i (have|need|got) to go)\b", re.IGNORECASE)
+# Hindi / Hinglish farewells. No \b here: Devanagari vowel signs are not "word characters" for regex.
+_FAREWELL_HI = re.compile(
+    r"अलविदा|बस इतना ही|और कुछ नहीं|फिर मिलते|फिर बात करते|रखता हूँ|रखती हूँ|रखता हूं|रखती हूं|चलता हूँ|चलती हूँ|चलता हूं|चलती हूं|"
+    r"बाय|नमस्ते[\s।.!]*$|alvida|bas itna hi|aur kuch nahi|phir milte|phir baat karte|rakhta h|rakhti h|chalta h|chalti h|"
+    r"namaste[\s.!]*$", re.IGNORECASE)
+_DEVANAGARI = re.compile(r"[\u0900-\u097F]")
 DEFAULT_GOODBYE = "Thank you for your time, {name}. Have a great day. Goodbye!"
+DEFAULT_GOODBYE_HI = "धन्यवाद {name} जी, आपका दिन शुभ हो। नमस्ते!"
+
+
+def _last_user_text(msgs: list[dict[str, Any]]) -> str:
+    last_user = next((m for m in reversed(msgs) if m["role"] == "user"), None)
+    return (last_user or {}).get("content") or ""
 
 
 def seller_is_leaving(msgs: list[dict[str, Any]]) -> bool:
-    last_user = next((m for m in reversed(msgs) if m["role"] == "user"), None)
-    return bool(last_user and _FAREWELL.search(last_user.get("content") or ""))
+    text = _last_user_text(msgs)
+    return bool(_FAREWELL.search(text) or _FAREWELL_HI.search(text))
 
 
-def _stage(msgs: list[dict[str, Any]]) -> tuple[bool, int, bool]:
-    """(data loaded?, seller turns since the data was loaded, summary shown?)"""
-    loaded, since, summary = False, 0, False
-    for m in msgs:
-        for tc in m.get("tool_calls") or []:
-            name = tc["function"]["name"]
-            loaded = loaded or name == "get_seller_diagnosis"
-            summary = summary or name == "show_call_summary"
-        if loaded and m["role"] == "user":
-            since += 1
-    return loaded, since, summary
+def seller_speaks_hindi(msgs: list[dict[str, Any]]) -> bool:
+    """True when the seller's latest message is in Devanagari (speech-to-text writes Hindi that way)."""
+    return bool(_DEVANAGARI.search(_last_user_text(msgs)))
 
 
-def stage_tools(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    loaded, since, summary = _stage(msgs)
-    if seller_is_leaving(msgs):
-        return [TOOLS["end_call"]]
-    if not loaded:
-        return [TOOLS["get_seller_diagnosis"]]
-    if summary:
-        return [TOOLS["end_call"]]
-    return [TOOLS["show_call_summary"]] if since >= SUMMARY_AFTER_SELLER_TURNS else []
-
-
-def stage_hint(msgs: list[dict[str, Any]]) -> str | None:
-    loaded, since, summary = _stage(msgs)
-    if seller_is_leaving(msgs):
-        return ("The seller is ending the call. Say a warm goodbye in one short sentence (thank them by name, wish "
-                "them well; if actions were agreed, mention you will check in in seven days) and call end_call. "
-                "Do not ask another question.")
-    if not loaded:
-        return None
-    if summary:
-        step = ("Give a recap of two sentences at most, offer a follow-up check-in in seven days and ask if there is "
-                "anything else. If the seller says they are done, say a warm goodbye and call end_call.")
-    elif since < len(_STEPS):
-        step = _STEPS[since]
-    else:
-        step = ("If the seller is comfortable with the plan, call show_call_summary now. Otherwise answer their "
-                "concern briefly.")
-    return ("Suggested next step. If the seller asked a question, disagreed or changed topic, answer that first in "
-            "one or two sentences, then continue with this step: " + step)
+def language_note(msgs: list[dict[str, Any]], hindi_voice: bool = True) -> str | None:
+    """A per-turn reminder of the reply language. Recency matters: small models forget a rule
+    that sits far up in the system prompt."""
+    if not seller_speaks_hindi(msgs):
+        spoke_hindi_before = any(m["role"] == "user" and _DEVANAGARI.search(m.get("content") or "") for m in msgs)
+        return ("IMPORTANT, language for this reply: the seller's last message is in English, so reply ONLY in "
+                "English, even though earlier turns were in Hindi.") if spoke_hindi_before else None
+    if hindi_voice:
+        return ("Language for this reply: the seller is speaking Hindi. Reply in simple everyday Hinglish written in "
+                "Devanagari, keeping business words and product names in English, numbers in Hindi words, and "
+                "feminine verb forms for yourself (देखती हूँ, समझ गई, करूँगी).")
+    # The seller's device has no Hindi voice, so Devanagari could not be spoken aloud.
+    return ("Language for this reply: the seller is speaking Hindi. Reply in natural Hinglish written in ROMAN "
+            "letters only (no Devanagari), for example 'Aapke orders kam hue hain kyunki stock khatam ho gaya tha'.")
 
 
 class LLMUnavailable(Exception):
@@ -231,13 +308,19 @@ _SPEECH_FIXES = str.maketrans({"‑": "-", "‐": "-", "–": "-", "—": ", ", 
                                "“": '"', "”": '"', "*": "", "#": "", " ": " ", " ": " "})
 
 
+# reply cut-off points: a question mark, an opening brace/bracket, or a sentence end followed by a space
+_STOP = re.compile(r"\?|[{\[]|[.!।](?=\s)")
+_TOOL_NAMES = re.compile(r"\b(get_seller_diagnosis|show_on_screen|show_call_summary|end_call)\b(\(\))?")
+
+
 def _speakable(text: str) -> str:
-    """Replaces typographic characters that text-to-speech voices read badly or skip."""
-    return text.translate(_SPEECH_FIXES)
+    """Removes what must never be read aloud: typographic characters that voices read badly,
+    and tool names (a model that is not offered a tool sometimes writes its name as text)."""
+    return _TOOL_NAMES.sub("", text.translate(_SPEECH_FIXES))
 
 
 # ---------------------------------------------------------------- agent loop
-def run_turn(history: list[dict[str, Any]],
+def run_turn(history: list[dict[str, Any]], hindi_voice: bool = True, *,
              llm: Callable[..., Iterator[dict[str, Any]]] = groq_stream) -> Iterator[dict[str, Any]]:
     """Runs one seller turn. Yields events for the browser:
 
@@ -253,27 +336,55 @@ def run_turn(history: list[dict[str, Any]],
         for _ in range(MAX_TOOL_ROUNDS):
             text, calls = "", []
             convo = history + new
-            hint = stage_hint(convo)
-            prompt = messages + new + ([{"role": "system", "content": hint}] if hint else [])
+            notes = [n for n in (language_note(convo, hindi_voice), stage_hint(convo)) if n]
+            prompt = messages + new + ([{"role": "system", "content": "\n".join(notes)}] if notes else [])
             asked = False  # a question ends the agent's turn; anything after it is dropped
+            sentences = 0
+            held = ""      # last, possibly unfinished word: held back so a word split across chunks is filtered whole
+
+            def release(chunk: str) -> Iterator[dict[str, Any]]:
+                nonlocal text, spoke, asked
+                nonlocal sentences
+                chunk = _speakable(chunk)
+                if asked or not chunk:
+                    return
+                # Guard rails. A reply stops at: (1) its first question, since some models answer themselves
+                # and keep talking; (2) a brace, since speech never contains one and it means the model is
+                # writing tool data as text; (3) MAX_SENTENCES sentences, so one reply holds one idea.
+                for m in _STOP.finditer(chunk):
+                    if m.group() in "{[":
+                        chunk, asked = chunk[:m.start()].rstrip(" ("), True
+                    elif m.group().startswith("?"):
+                        chunk, asked = chunk[:m.start() + 1], True
+                    else:
+                        sentences += 1
+                        if sentences >= MAX_SENTENCES:
+                            chunk, asked = chunk[:m.start() + 1], True
+                    if asked:
+                        break
+                if not chunk:
+                    return
+                if spoke and not text:
+                    yield {"type": "text", "delta": " "}  # keep rounds from running together
+                text += chunk
+                spoke = True
+                yield {"type": "text", "delta": chunk}
+
             for ev in llm(prompt, stage_tools(convo)):
                 if "text" in ev:
-                    if asked:
-                        continue
-                    delta = _speakable(ev["text"])
-                    if "?" in delta:
-                        # Guard rail: some models answer their own question and keep talking.
-                        delta, asked = delta[:delta.index("?") + 1], True
-                    if spoke and not text:
-                        yield {"type": "text", "delta": " "}  # keep rounds from running together
-                    text += delta
-                    spoke = True
-                    yield {"type": "text", "delta": delta}
+                    held += ev["text"]
+                    cut = max(held.rfind(" "), held.rfind("\n")) + 1
+                    ready, held = held[:cut], held[cut:]
+                    yield from release(ready)
                 elif "tool_calls" in ev:
                     calls = ev["tool_calls"]
+            yield from release(held)
+            if not text.strip():
+                text = ""
             if any(c["name"] == "end_call" for c in calls) and not spoke:
                 # Guard rail: never hang up silently. If the model ended the call without a goodbye, add one.
-                text = DEFAULT_GOODBYE.format(name=cfg.SELLER_NAME)
+                hindi = seller_speaks_hindi(history) and hindi_voice
+                text = (DEFAULT_GOODBYE_HI if hindi else DEFAULT_GOODBYE).format(name=cfg.SELLER_NAME)
                 spoke = True
                 yield {"type": "text", "delta": text}
             if not calls:

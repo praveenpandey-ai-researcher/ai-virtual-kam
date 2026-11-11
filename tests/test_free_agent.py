@@ -24,8 +24,8 @@ def scripted_llm(*rounds):
 
 def test_plain_reply():
     llm = scripted_llm(("Hello there.", []))
-    events = list(free_agent.run_turn([{"role": "user", "content": "hi"}], llm))
-    assert events[0] == {"type": "text", "delta": "Hello there."}
+    events = list(free_agent.run_turn([{"role": "user", "content": "hi"}], llm=llm))
+    assert "".join(e["delta"] for e in events if e["type"] == "text") == "Hello there."
     assert events[-1] == {"type": "done", "messages": [{"role": "assistant", "content": "Hello there."}]}
     assert llm.calls[0][0]["role"] == "system"  # system prompt is added server-side
 
@@ -33,7 +33,7 @@ def test_plain_reply():
 def test_tool_round_feeds_diagnosis_back_to_llm():
     llm = scripted_llm(("Let me pull up your account.", [("get_seller_diagnosis", {"seller_concern": "sales dropped"})]),
                        ("Your orders fell.", []))
-    events = list(free_agent.run_turn([{"role": "user", "content": "sales dropped"}], llm))
+    events = list(free_agent.run_turn([{"role": "user", "content": "sales dropped"}], llm=llm))
     tools = [(e["name"], e["args"]) for e in events if e["type"] == "tool"]
     assert tools == [("get_seller_diagnosis", {"seller_concern": "sales dropped"})]
     # the second LLM call must contain the tool result with real engine numbers
@@ -48,7 +48,7 @@ def test_tool_round_feeds_diagnosis_back_to_llm():
 
 def test_end_call_stops_the_loop():
     llm = scripted_llm(("Goodbye!", [("end_call", {})]))
-    events = list(free_agent.run_turn([{"role": "user", "content": "bye"}], llm))
+    events = list(free_agent.run_turn([{"role": "user", "content": "bye"}], llm=llm))
     assert {"type": "tool", "name": "end_call", "args": {}} in events
     assert len(llm.calls) == 1
 
@@ -58,7 +58,7 @@ def test_llm_unavailable_is_reported():
         raise free_agent.LLMUnavailable("All models are busy")
         yield  # pragma: no cover
 
-    events = list(free_agent.run_turn([{"role": "user", "content": "hi"}], llm))
+    events = list(free_agent.run_turn([{"role": "user", "content": "hi"}], llm=llm))
     assert events == [{"type": "error", "message": "All models are busy"}]
 
 
@@ -66,7 +66,7 @@ def test_bad_tool_arguments_do_not_crash():
     def llm(_messages, _tools):
         yield {"tool_calls": [{"id": "x", "name": "show_on_screen", "arguments": "{not json"}]}
 
-    events = list(free_agent.run_turn([{"role": "user", "content": "hi"}], llm))
+    events = list(free_agent.run_turn([{"role": "user", "content": "hi"}], llm=llm))
     assert {"type": "tool", "name": "show_on_screen", "args": {}} in events
 
 
@@ -96,7 +96,14 @@ def test_tools_are_gated_by_stage():
     assert _offered(loaded) == []  # cannot summarise or hang up early
     late = loaded + [user] * free_agent.SUMMARY_AFTER_SELLER_TURNS
     assert _offered(late) == ["show_call_summary"]
-    assert _offered(late + [_call("show_call_summary")]) == ["end_call"]
+    # ...or as soon as all three recommendations have actually been spoken
+    said = lambda text: {"role": "assistant", "content": text}
+    recs = loaded + [said("Restock your best-sellers first."), said("Update stock counts daily and pause listings at zero."), said("Then run a short promotion.")]
+    assert _offered(recs) == ["show_call_summary"]
+    assert _offered(recs[:-1]) == []
+    shown = late + [_call("show_call_summary")]
+    assert _offered(shown) == []                                    # not in the same turn as the summary
+    assert _offered(shown + [{"role": "user", "content": "no"}]) == ["end_call"]
 
 
 def test_stage_hints_follow_the_plan():
@@ -106,7 +113,11 @@ def test_stage_hints_follow_the_plan():
     assert "supply or restocking" in free_agent.stage_hint(loaded)
     assert "cancellations" in free_agent.stage_hint(loaded + [user])
     assert "recommendation 1 ONLY" in free_agent.stage_hint(loaded + [user] * 3)
-    assert "call end_call" in free_agent.stage_hint(loaded + [_call("show_call_summary")])
+    # hints follow what was actually said, not the turn count
+    ahead = loaded + [user, {"role": "assistant", "content": "पहले अपने बेस्ट-सेलर्स को रीस्टॉक करें।"}]
+    assert "recommendation 2 ONLY" in free_agent.stage_hint(ahead)
+    assert "wait for the seller" in free_agent.stage_hint(loaded + [_call("show_call_summary")])
+    assert "call end_call" in free_agent.stage_hint(loaded + [_call("show_call_summary"), user])
 
 
 def test_reply_is_cut_at_the_first_question():
@@ -115,7 +126,7 @@ def test_reply_is_cut_at_the_first_question():
         yield {"text": " Yes, that works for me. Finally, run a promotion."}
         yield {"tool_calls": []}
 
-    events = list(free_agent.run_turn([{"role": "user", "content": "ok"}], llm))
+    events = list(free_agent.run_turn([{"role": "user", "content": "ok"}], llm=llm))
     assert events[-1]["messages"] == [{"role": "assistant", "content": "Update stock daily. Shall we continue?"}]
 
 
@@ -135,7 +146,68 @@ def test_seller_can_end_the_call_at_any_point():
 
 def test_never_hangs_up_without_a_goodbye():
     llm = scripted_llm(("", [("end_call", {})]))   # the model ends the call but says nothing
-    events = list(free_agent.run_turn([{"role": "user", "content": "bye"}], llm))
+    events = list(free_agent.run_turn([{"role": "user", "content": "bye"}], llm=llm))
     spoken = "".join(e["delta"] for e in events if e["type"] == "text")
     assert "Goodbye" in spoken and "Praveen" in spoken
     assert events.index(next(e for e in events if e["type"] == "text")) < events.index({"type": "tool", "name": "end_call", "args": {}})
+
+
+HINDI = {"role": "user", "content": "मेरी sales इस महीने बहुत कम हो गई हैं"}
+
+
+def test_language_note_follows_the_seller():
+    assert free_agent.language_note([{"role": "user", "content": "My sales dropped"}]) is None
+    assert "Devanagari" in free_agent.language_note([HINDI])
+    assert "ROMAN" in free_agent.language_note([HINDI], hindi_voice=False)   # device has no Hindi voice
+    # switching back to English is called out explicitly
+    back = free_agent.language_note([HINDI, {"role": "assistant", "content": "जी"}, {"role": "user", "content": "okay thanks"}])
+    assert "ONLY in English" in back
+
+
+def test_language_note_reaches_the_llm():
+    llm = scripted_llm(("जी, मैं देखती हूँ।", []))
+    list(free_agent.run_turn([HINDI], llm=llm))
+    assert "Hinglish" in llm.calls[0][-1]["content"]
+
+
+def test_hindi_farewells_end_the_call():
+    for phrase in ["ठीक है धन्यवाद, बस इतना ही", "अच्छा चलता हूँ", "theek hai, phir milte hain", "ओके बाय", "धन्यवाद, नमस्ते"]:
+        assert free_agent.seller_is_leaving([{"role": "user", "content": phrase}]), phrase
+    for phrase in ["नमस्ते, मेरी sales कम हो गई हैं", "हाँ, supplier ने देर कर दी", "स्टॉक खत्म हो गया था"]:
+        assert not free_agent.seller_is_leaving([{"role": "user", "content": phrase}]), phrase
+
+
+def test_default_goodbye_is_in_the_sellers_language():
+    def silent_end(_messages, _tools):
+        yield {"tool_calls": [{"id": "x", "name": "end_call", "arguments": "{}"}]}
+
+    spoken = "".join(e["delta"] for e in free_agent.run_turn([{"role": "user", "content": "ओके बाय"}], llm=silent_end) if e["type"] == "text")
+    assert "नमस्ते" in spoken
+
+
+def test_tool_names_are_never_spoken_even_when_split_across_chunks():
+    def llm(_messages, _tools):
+        for piece in ["Update stock daily.", " show_", "call_", "summary", " Thanks."]:
+            yield {"text": piece}
+        yield {"tool_calls": []}
+
+    events = list(free_agent.run_turn([{"role": "user", "content": "ok"}], llm=llm))
+    spoken = "".join(e["delta"] for e in events if e["type"] == "text")
+    assert "show" not in spoken and "summary" not in spoken
+    assert spoken.split() == ["Update", "stock", "daily.", "Thanks."]
+
+
+def test_reply_stops_at_data_and_after_three_sentences():
+    def spilled(_messages, _tools):
+        yield {"text": 'Update stock daily. ({"key_issue": "stock-outs"}) We found the cause.'}
+        yield {"tool_calls": []}
+
+    out = "".join(e["delta"] for e in free_agent.run_turn([{"role": "user", "content": "ok"}], llm=spilled) if e["type"] == "text")
+    assert out.strip() == "Update stock daily."
+
+    def rambling(_messages, _tools):
+        yield {"text": "One. Two is 32.5 percent. Three. Four. Five."}
+        yield {"tool_calls": []}
+
+    out = "".join(e["delta"] for e in free_agent.run_turn([{"role": "user", "content": "ok"}], llm=rambling) if e["type"] == "text")
+    assert out.strip() == "One. Two is 32.5 percent. Three."

@@ -124,6 +124,7 @@ class Message(BaseModel):
 
 class TurnRequest(BaseModel):
     history: list[Message] = Field(max_length=80)
+    hindi_voice: bool = True  # False when the seller's browser has no Hindi voice: reply in Roman Hinglish
 
 
 @app.post("/api/free/turn")
@@ -132,7 +133,7 @@ def free_turn(req: TurnRequest) -> StreamingResponse:
     history: list[dict[str, Any]] = [m.model_dump(exclude_none=True) for m in req.history]
 
     def events():
-        for ev in free_agent.run_turn(history):
+        for ev in free_agent.run_turn(history, req.hindi_voice):
             yield json.dumps(ev, ensure_ascii=False) + "\n"
 
     return StreamingResponse(events(), media_type="application/x-ndjson",
@@ -143,12 +144,27 @@ def free_turn(req: TurnRequest) -> StreamingResponse:
 MAX_AUDIO_BYTES = 4_000_000
 AUDIO_EXT = {"audio/webm": "webm", "audio/mp4": "mp4", "audio/ogg": "ogg", "audio/wav": "wav", "audio/mpeg": "mp3"}
 # Domain words help Whisper spell what sellers actually say.
-WHISPER_PROMPT = "A Snapdeal seller talking to their account manager about sales, orders, cancellations, stock, restocking, supplier, listings and prices."
+WHISPER_PROMPTS = {
+    "en": "A Snapdeal seller talking to their account manager about sales, orders, cancellations, stock, restocking, supplier, listings and prices.",
+    "hi": "Snapdeal seller अपने account manager से बात कर रहा है: sales, orders, stock, cancellation, supplier, listing, price.",
+}
+AUTO_DETECT_MIN_MS = 2500  # language detection is unreliable on very short clips ("yes", "okay", "हाँ")
+
+
+def _lang_code(name: str | None) -> str:
+    name = (name or "").strip().lower()
+    return "en" if name.startswith("en") else "hi" if name.startswith("hi") else name
 
 
 @app.post("/api/free/transcribe")
 async def free_transcribe(request: Request) -> dict:
-    """Transcribes one spoken seller turn with Whisper (Groq). The browser records it after detecting a pause."""
+    """Transcribes one spoken seller turn with Whisper (Groq). The browser records it after detecting a pause.
+
+    Language: English and Hindi/Hinglish are supported. Long enough clips are auto-detected; short ones
+    use the conversation's current language (sent by the browser). Whisper often labels Hindi speech as
+    Urdu or another language and writes it in the wrong script, so anything that is not English or
+    Hindi is transcribed again as Hindi.
+    """
     key = _env("GROQ_API_KEY")
     if not key:
         raise HTTPException(503, "Transcription is not configured")
@@ -160,15 +176,33 @@ async def free_transcribe(request: Request) -> dict:
         raise HTTPException(400, "Empty audio")
     if len(audio) > MAX_AUDIO_BYTES:
         raise HTTPException(413, "Audio too long")
+    hint = request.headers.get("x-lang-hint", "en").lower()
+    hint = hint if hint in WHISPER_PROMPTS else "en"
+    try:
+        voiced_ms = int(request.headers.get("x-voiced-ms", "0"))
+    except ValueError:
+        voiced_ms = 0
+
+    last = None
     async with httpx.AsyncClient(timeout=30) as http:
-        last = None
-        for model in ("whisper-large-v3-turbo", "whisper-large-v3"):  # second model = separate rate limit
-            last = await http.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {key}"},
-                files={"file": (f"speech.{AUDIO_EXT[content_type]}", audio, content_type)},
-                data={"model": model, "language": "en", "temperature": "0", "response_format": "json", "prompt": WHISPER_PROMPT},
-            )
-            if last.status_code == 200:
-                return {"text": (last.json().get("text") or "").strip()}
+        async def whisper(language: str | None) -> tuple[str, str] | None:
+            nonlocal last
+            data = {"temperature": "0", "response_format": "verbose_json"}
+            if language:
+                data.update(language=language, prompt=WHISPER_PROMPTS[language])
+            for model in ("whisper-large-v3-turbo", "whisper-large-v3"):  # second model = separate rate limit
+                last = await http.post("https://api.groq.com/openai/v1/audio/transcriptions",
+                                       headers={"Authorization": f"Bearer {key}"},
+                                       files={"file": (f"speech.{AUDIO_EXT[content_type]}", audio, content_type)},
+                                       data={"model": model, **data})
+                if last.status_code == 200:
+                    j = last.json()
+                    return (j.get("text") or "").strip(), language or _lang_code(j.get("language"))
+            return None
+
+        result = await whisper(None if voiced_ms >= AUTO_DETECT_MIN_MS else hint)
+        if result and result[1] not in WHISPER_PROMPTS:
+            result = await whisper("hi")       # e.g. detected as Urdu: same speech, wrong script
+        if result:
+            return {"text": result[0], "language": result[1]}
     raise HTTPException(502, f"Transcription failed ({last.status_code if last is not None else 'no response'})")

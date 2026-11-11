@@ -39,7 +39,9 @@ advice is identical. Because smaller open models drift from long prompts, the fa
 guard rails in code: tools are offered only at the right stage of the call (the model cannot end the call
 before the summary), a one-line next-step hint keeps it on plan, and a reply is cut at its first question.
 
-For the best fallback voice use Microsoft Edge (natural Indian-English voice); headphones allow interrupting by voice.
+In fallback mode the agent also **matches the seller's language**: speak Hindi or Hinglish and it answers in everyday
+Hinglish (Hindi with the business words in English), switches back when the seller does, and ends the call by
+itself with a goodbye. Interrupting by voice is automatic. For the most natural voices use Microsoft Edge.
 
 ## What the agent concludes from the sample data
 

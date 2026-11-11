@@ -434,13 +434,13 @@ function show(id, run = SECTIONS[id]) {
 
 // Safety net: if the agent talks about a topic without calling show_on_screen, show it anyway.
 const KEYWORDS = [
-  ["pricing", /\b(price|prices|pricing|discount)/i],
-  ["inventory", /out of stock|stock-?outs?|ran out|inventory|supply|restock/i],
-  ["cancellations", /cancel/i],
-  ["root_cause", /visibility|ranking|root cause|one (inventory )?problem/i],
-  ["action_1", /restock.*(best-?sellers|first)|reorder alert|prioriti[sz]e restocking/i],
-  ["action_2", /stock counts|pause (your )?listings|small buffer/i],
-  ["action_3", /promotion|sponsored|sale event/i],
+  ["pricing", /\b(price|prices|pricing|discount)|प्राइस|कीमत|दाम|डिस्काउंट/i],
+  ["inventory", /out of stock|stock-?outs?|ran out|inventory|supply|restock|स्टॉक|सप्लाई|इन्वेंटरी/i],
+  ["cancellations", /cancel|कैंसल|कैन्सल|कैंसिल|रद्द/i],
+  ["root_cause", /visibility|ranking|root cause|one (inventory )?problem|विज़िबिलिटी|विजिबिलिटी|रैंकिंग/i],
+  ["action_1", /restock.*(best-?sellers?|first|पहले|सबसे)|(best-?sellers?|बेस्ट.?सेलर).*(restock|रीस्टॉक)|reorder alert|रीऑर्डर|prioriti[sz]e restocking/i],
+  ["action_2", /stock counts?|pause (your )?listings?|listings? (को )?pause|small buffer|buffer|बफ़र|बफर|स्टॉक काउंट/i],
+  ["action_3", /promotion|sponsored|sale event|प्रमोशन|स्पॉन्सर/i],
 ];
 function showFromSpeech(text) {
   if (!diagnosis) return;
@@ -480,7 +480,7 @@ const FORCE_MODE = query.get("mode");
 // (see `echoPeak`). Auto gain is off too, so it cannot amplify the agent's voice from the speakers.
 const MIC = { audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: false } };
 const DEFAULT_HINT = els.hint.textContent;
-const FREE_HINT = "Speak naturally; you can talk over Riya to interrupt her. The call ends by itself when you say goodbye.";
+const FREE_HINT = "Speak naturally in English or Hindi; you can talk over Riya to interrupt her. The call ends by itself when you say goodbye.";
 const FEED_WAITING = "Call in progress. Riya will bring up your data here as you talk.";
 
 function callStarted(modeLabel) {
@@ -577,23 +577,31 @@ async function startElevenLabs(info) {
 }
 
 // ---------- mode 2: free fallback (browser speech + Groq agent loop on our server)
-/** Picks the most natural English voice the browser offers, preferring Indian English. */
-async function pickVoice() {
+/** Picks the most natural English voice (preferring Indian English) and the best Hindi voice, if any. */
+async function pickVoices() {
   let voices = speechSynthesis.getVoices();
   if (!voices.length) {
     await new Promise((r) => { speechSynthesis.addEventListener("voiceschanged", r, { once: true }); setTimeout(r, 1500); });
     voices = speechSynthesis.getVoices();
   }
-  const score = (v) => {
-    const natural = /natural|online|neural/i.test(v.name);
+  const natural = (v) => /natural|online|neural/i.test(v.name);
+  const english = (v) => {
     if (/neerja/i.test(v.name)) return 100;                       // Edge: natural Indian-English female voice
-    if (/en[-_]IN/i.test(v.lang)) return natural ? 90 : 70;
-    if (/^en/i.test(v.lang) && natural) return 60;
+    if (/en[-_]IN/i.test(v.lang)) return natural(v) ? 90 : 70;
+    if (/^en/i.test(v.lang) && natural(v)) return 60;
     if (/google (uk|us) english/i.test(v.name)) return 50;
     return /^en/i.test(v.lang) ? 20 : 0;
   };
-  return voices.slice().sort((a, b) => score(b) - score(a))[0] || null;
+  const hindi = (v) => {
+    if (!/^hi/i.test(v.lang)) return 0;
+    if (/swara/i.test(v.name)) return 100;                        // Edge: natural Hindi female voice
+    return natural(v) ? 90 : /google/i.test(v.name) ? 70 : 50;
+  };
+  const best = (score) => voices.filter((v) => score(v) > 0).sort((p, q) => score(q) - score(p))[0] || null;
+  return { en: best(english), hi: best(hindi) };
 }
+
+const DEVANAGARI = /[\u0900-\u097F]/;
 
 async function startFree(info, mic) {
   if (!window.speechSynthesis || !window.MediaRecorder) {
@@ -603,7 +611,12 @@ async function startFree(info, mic) {
   const SILENCE_MS = 1100;      // pause that ends the seller's turn
   const TICK_MS = 50;
   const history = [];           // the browser owns the conversation; the server is stateless
-  const voice = await pickVoice();
+  const voices = await pickVoices();
+  const voice = voices.en;
+  // Language auto-match: Riya answers in the language the seller last used. Tracked here so the
+  // lines the page says by itself (filler, "are you there", goodbye) and the voice follow along.
+  let convLang = "en";
+  const hindi = () => convLang === "hi" && !!voices.hi;
   let active = true, phase = "idle", endAfterSpeech = false;
   let pending = 0, streamOpen = false, sentenceBuf = "", controller = null;
 
@@ -624,8 +637,9 @@ async function startFree(info, mic) {
     const s = sentence.trim();
     if (!s || !active) return;
     const u = new SpeechSynthesisUtterance(s);
-    if (voice) { u.voice = voice; u.lang = voice.lang; }
-    u.rate = 1.04;
+    const v = DEVANAGARI.test(s) && voices.hi ? voices.hi : voice;   // Hindi text gets the Hindi voice
+    if (v) { u.voice = v; u.lang = v.lang; }
+    u.rate = v === voices.hi ? 1.0 : 1.04;
     utterances.push(u);
     pending++;
     u.onend = u.onerror = () => { pending = Math.max(0, pending - 1); afterSpeech(); };
@@ -650,7 +664,7 @@ async function startFree(info, mic) {
   function feed(delta) {
     sentenceBuf += delta;
     let m;
-    while ((m = sentenceBuf.match(/^([\s\S]*?[.!?])\s+/))) { enqueue(m[1]); sentenceBuf = sentenceBuf.slice(m[0].length); }
+    while ((m = sentenceBuf.match(/^([\s\S]*?[.!?।])\s+/))) { enqueue(m[1]); sentenceBuf = sentenceBuf.slice(m[0].length); }
   }
   function flush() { enqueue(sentenceBuf); sentenceBuf = ""; }
   function afterSpeech() {
@@ -733,8 +747,11 @@ async function startFree(info, mic) {
       if (idleMs >= IDLE_NUDGE_MS) {
         idleMs = 0;
         stopListening();
-        const line = nudges++ === 0 ? `Are you still there, ${info.seller_name || "there"}?`
-          : "It seems you have stepped away, so I will end the call for now. Feel free to call back any time. Goodbye!";
+        const name = info.seller_name || "";
+        const line = nudges++ === 0
+          ? (hindi() ? `${name} जी, क्या आप line पर हैं?` : `Are you still there, ${name}?`)
+          : (hindi() ? "लगता है आप अभी busy हैं, तो मैं call यहीं समाप्त करती हूँ। आप कभी भी दोबारा call कर सकते हैं। नमस्ते!"
+            : "It seems you have stepped away, so I will end the call for now. Feel free to call back any time. Goodbye!");
         if (nudges > 1) endAfterSpeech = true;
         history.push({ role: "assistant", content: line });
         liveBubble("agent").set(line);
@@ -772,7 +789,8 @@ async function startFree(info, mic) {
     let text = "";
     try {
       const res = await fetch("/api/free/transcribe", { method: "POST", body: audio,
-        headers: { "Content-Type": (audio.type || "audio/webm").split(";")[0] } });
+        headers: { "Content-Type": (audio.type || "audio/webm").split(";")[0],
+          "X-Lang-Hint": convLang, "X-Voiced-Ms": String(spokenMs) } });
       if (!res.ok) throw new Error(`transcription failed (${res.status})`);
       text = ((await res.json()).text || "").trim();
     } catch (err) {
@@ -782,8 +800,8 @@ async function startFree(info, mic) {
     if (!active || phase !== "thinking") return;
     if (bargedIn) {
       bargedIn = false;
-      const mine = new Set(lastAgentText.toLowerCase().match(/[a-z']+/g) || []);
-      const words = text.toLowerCase().match(/[a-z']+/g) || [];
+      const mine = new Set(lastAgentText.toLowerCase().match(/[\p{L}\p{M}']+/gu) || []);
+      const words = text.toLowerCase().match(/[\p{L}\p{M}']+/gu) || [];
       const overlap = words.filter((w) => mine.has(w)).length / (words.length || 1);
       if (words.length >= 4 && overlap >= 0.75) { console.info("Ignored echo of the agent's own voice."); listen(); return; }
     }
@@ -810,6 +828,7 @@ async function startFree(info, mic) {
   // ----- one seller turn: send to our agent loop, speak the streamed reply, apply tool events
   async function submit(text, attempt = 0) {
     if (!active) return;
+    if (attempt === 0) convLang = DEVANAGARI.test(text) ? "hi" : "en";   // speech-to-text writes Hindi in Devanagari
     if (attempt === 0) history.push({ role: "user", content: text });
     phase = "thinking";
     setState("thinking", "Riya is thinking…");
@@ -819,7 +838,7 @@ async function startFree(info, mic) {
     const mySignal = controller.signal;
     try {
       const res = await fetch("/api/free/turn", { method: "POST", signal: mySignal,
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ history }) });
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ history, hindi_voice: !!voices.hi }) });
       if (!res.ok) throw new Error(`server error ${res.status}`);
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -844,7 +863,7 @@ async function startFree(info, mic) {
             if (ev.name === "get_seller_diagnosis") {
               if (!said.trim()) {
                 // The data fetch costs one extra LLM round. Fill the gap straight away so there is no dead air.
-                said = "Let me pull up your account. ";
+                said = hindi() ? "एक मिनट, मैं आपका account देखती हूँ। " : "Let me pull up your account. ";
                 lastAgentText = said;
                 bubble = bubble || liveBubble("agent");
                 bubble.set(said);
@@ -874,11 +893,12 @@ async function startFree(info, mic) {
     if (failed && !said) {
       // rate limit or network blip: tell the seller, wait, try once more
       if (attempt < 2) {
-        if (attempt === 0) enqueue("Give me a moment, please.");
+        if (attempt === 0) enqueue(hindi() ? "एक मिनट दीजिए, please।" : "Give me a moment, please.");
         await new Promise((r) => setTimeout(r, 6000));
         return submit(text, attempt + 1);
       }
-      enqueue("Sorry, I'm having trouble connecting right now. Please try again in a minute.");
+      enqueue(hindi() ? "Sorry, अभी connection में दिक्कत आ रही है। कृपया एक मिनट बाद फिर कोशिश करें।"
+        : "Sorry, I'm having trouble connecting right now. Please try again in a minute.");
       return;
     }
     flush();
@@ -930,7 +950,7 @@ async function startFree(info, mic) {
   els.hint.textContent = FREE_HINT;
   if (info.reason && info.reason !== "requested") console.info("Fallback voice mode:", info.reason);
 
-  if (query.has("debug")) window.__kam = { submit, interrupt, history, state: () => ({ phase, hearing, noise, level: micLevel(), pending, echoPeak, bargeMs, speakingMs }) };
+  if (query.has("debug")) window.__kam = { submit, interrupt, history, voices, state: () => ({ phase, hearing, noise, convLang, level: micLevel(), pending, echoPeak, bargeMs, speakingMs }) };
 
   // Riya opens the call
   lastAgentText = info.first_message;
