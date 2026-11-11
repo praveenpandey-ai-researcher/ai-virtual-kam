@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Virtual KAM</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">KAM</span>
+      <div>
+        <div class="brand-title">Virtual Key Account Manager</div>
+        <div class="brand-sub">AI voice assistant for sellers · prototype</div>
+      </div>
+    </div>
+    <div class="seller-chip">Seller support line</div>
+  </header>
+
+  <main class="layout">
+    <!-- Left: the call -->
+    <section class="card call">
+      <div class="voice">
+        <div class="orb" id="orb" data-state="idle">
+          <span class="orb-ring"></span>
+          <span class="orb-core">R</span>
+        </div>
+        <div class="wave" id="wave" aria-hidden="true"></div>
+        <div class="status" id="status">Ready to call</div>
+      </div>
+      <button id="call-btn" class="btn btn-start">Start call</button>
+      <p class="hint" id="hint">Uses your microphone. Speak naturally; you can interrupt at any time.</p>
+
+      <h2 class="section-title">Live transcript</h2>
+      <div class="transcript" id="transcript">
+        <p class="empty">The conversation will appear here.</p>
+      </div>
+    </section>
+
+    <!-- Right: a feed that starts empty; sections appear as the conversation reaches them -->
+    <section class="side" id="feed" aria-live="polite"></section>
+  </main>
+
+  <div class="tooltip hidden" id="tooltip"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

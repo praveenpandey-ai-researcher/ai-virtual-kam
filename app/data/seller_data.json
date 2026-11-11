@@ -1,0 +1,49 @@
+{
+  "_note": "Monthly metrics are copied exactly from the assignment brief. Everything under 'assumptions' and 'illustrative' is mock data we added and is labelled as such (see PRD section 6).",
+  "seller": {
+    "name": "Sharma Home Essentials",
+    "contact_name": "Praveen",
+    "category": "Home & Kitchen",
+    "_source": "illustrative"
+  },
+  "metrics": {
+    "last_month": {
+      "sales": 200000,
+      "orders": 400,
+      "cancellation_rate": 0.08,
+      "average_selling_price": 500,
+      "out_of_stock_products": 5
+    },
+    "this_month": {
+      "sales": 135000,
+      "orders": 270,
+      "cancellation_rate": 0.14,
+      "average_selling_price": 500,
+      "out_of_stock_products": 18
+    },
+    "_source": "assignment brief"
+  },
+  "assumptions": {
+    "A1_sales_is_gross_order_value": true,
+    "A2_orders_include_cancelled": true,
+    "A3_active_catalogue_size": 50
+  },
+  "illustrative": {
+    "_note": "The 13 products that went out of stock this month (18 now minus 5 last month), with the orders each one got last month while in stock. Mock data, used to prioritise restocking.",
+    "newly_out_of_stock": [
+      {"product": "Stainless Steel Water Bottle 1L", "orders_last_month": 24},
+      {"product": "Non-stick Tawa 28cm", "orders_last_month": 19},
+      {"product": "Glass Storage Jar Set (3 pcs)", "orders_last_month": 15},
+      {"product": "Kitchen Knife Set (5 pcs)", "orders_last_month": 9},
+      {"product": "Cotton Kitchen Towels (pack of 6)", "orders_last_month": 8},
+      {"product": "Silicone Spatula Set", "orders_last_month": 7},
+      {"product": "Steel Lunch Box (3 tier)", "orders_last_month": 6},
+      {"product": "Spice Rack Organizer", "orders_last_month": 6},
+      {"product": "Vegetable Chopper", "orders_last_month": 5},
+      {"product": "Ceramic Coffee Mugs (set of 2)", "orders_last_month": 5},
+      {"product": "Dish Drying Rack", "orders_last_month": 4},
+      {"product": "Measuring Cups Set", "orders_last_month": 3},
+      {"product": "Table Mats (set of 6)", "orders_last_month": 2}
+    ]
+  }
+}
