@@ -476,6 +476,7 @@ const clientTools = {
 // The data panel, tools and transcript are shared; only the voice layer differs.
 const FORCE_MODE = query.get("mode");
 const DEFAULT_HINT = els.hint.textContent;
+const FREE_HINT = "Backup voice: speak after Riya finishes. Tap the circle or press Space to interrupt her.";
 const FEED_WAITING = "Call in progress. Riya will bring up your data here as you talk.";
 
 function callStarted(modeLabel) {
@@ -591,43 +592,58 @@ async function pickVoice() {
 }
 
 async function startFree(info, mic) {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR || !window.speechSynthesis) {
+  if (!window.speechSynthesis || !window.MediaRecorder) {
     mic.getTracks().forEach((t) => t.stop());
-    throw new Error("this browser has no built-in speech support. Please use Chrome or Edge.");
+    throw new Error("this browser cannot record or speak audio. Please use a current Chrome or Edge.");
   }
-  const SILENCE_MS = 1200;      // pause that ends the seller's turn
+  const SILENCE_MS = 1100;      // pause that ends the seller's turn
+  const TICK_MS = 50;
   const history = [];           // the browser owns the conversation; the server is stateless
   const voice = await pickVoice();
   let active = true, phase = "idle", endAfterSpeech = false;
   let pending = 0, streamOpen = false, sentenceBuf = "", controller = null;
 
-  // microphone level for the waveform
+  // microphone analyser: drives the waveform and our voice-activity detection
   const audioCtx = new AudioContext();
+  await audioCtx.resume().catch(() => {}); // a context created after an await can start suspended (= silence)
   const analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 128;
+  analyser.fftSize = 1024;
   audioCtx.createMediaStreamSource(mic).connect(analyser);
   const micData = new Uint8Array(analyser.frequencyBinCount);
+  const timeData = new Uint8Array(analyser.fftSize);
   const fakeData = new Uint8Array(48);
 
   // "I'm on headphones" lets the seller interrupt by voice. Without headphones the microphone
-  // would hear Riya's own voice from the speakers, so by default it is muted while she speaks.
+  // would hear Riya's own voice from the speakers, so by default it is ignored while she speaks.
   const label = el("label", "bargein");
   const box = label.appendChild(el("input"));
   box.type = "checkbox";
   label.appendChild(el("span", "", " I'm on headphones (let me interrupt by voice)"));
 
   // ----- speaking: sentences are spoken as they stream in
+  const utterances = [];        // keep references: Chrome can garbage-collect an utterance and never fire onend
+  let speechDeadline = 0, speechWatch = null;
   function enqueue(sentence) {
     const s = sentence.trim();
     if (!s || !active) return;
     const u = new SpeechSynthesisUtterance(s);
     if (voice) { u.voice = voice; u.lang = voice.lang; }
     u.rate = 1.04;
+    utterances.push(u);
     pending++;
     u.onend = u.onerror = () => { pending = Math.max(0, pending - 1); afterSpeech(); };
-    if (phase !== "speaking") { phase = "speaking"; setState("speaking", "Riya is speaking"); if (!box.checked) stopListening(); }
+    if (phase !== "speaking") { phase = "speaking"; setState("speaking", "Riya is speaking"); stopListening(); }
     speechSynthesis.speak(u);
+    // Watchdog: if the browser never reports the end of speech, move on anyway instead of hanging.
+    speechDeadline = Math.max(performance.now(), speechDeadline) + s.length * 95 + 1500;
+    clearTimeout(speechWatch);
+    speechWatch = setTimeout(() => {
+      if (!active || pending === 0) return;
+      console.warn("Speech end was not reported by the browser; continuing.");
+      pending = 0;
+      speechSynthesis.cancel();
+      afterSpeech();
+    }, speechDeadline - performance.now());
   }
   function feed(delta) {
     sentenceBuf += delta;
@@ -637,67 +653,113 @@ async function startFree(info, mic) {
   function flush() { enqueue(sentenceBuf); sentenceBuf = ""; }
   function afterSpeech() {
     if (!active || pending > 0 || streamOpen) return;
+    clearTimeout(speechWatch);
+    utterances.length = 0;
+    speechDeadline = 0;
     if (endAfterSpeech) { finish(); return; }
-    listen();
+    phase = "idle";
+    setTimeout(() => { if (active && phase === "idle") listen(); }, 250); // let the speaker's echo tail die down
   }
 
-  // ----- listening: collect speech until the seller pauses
-  const rec = new SR();
-  rec.lang = "en-IN";
-  rec.continuous = true;
-  rec.interimResults = true;
-  let recOn = false, heard = "", interim = "", silenceTimer = null, draft = null;
-  function startRec() { if (!recOn) { try { rec.start(); recOn = true; } catch { /* already started */ } } }
-  function stopListening() { clearTimeout(silenceTimer); if (recOn) { recOn = false; try { rec.abort(); } catch { /* not running */ } } }
-  function listen() {
+  // ----- listening: our own voice-activity detection + Whisper transcription on the server.
+  // (The browser's built-in SpeechRecognition fails silently on some setups, so we do not rely on it.)
+  const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
+  let recorder = null, recStarted = 0;
+  let noise = 0.008, hearing = false, voicedMs = 0, runMs = 0, silenceMs = 0, bargeMs = 0;
+
+  function micLevel() { // RMS loudness, 0..1
+    analyser.getByteTimeDomainData(timeData);
+    let sum = 0;
+    for (const v of timeData) { const x = (v - 128) / 128; sum += x * x; }
+    return Math.sqrt(sum / timeData.length);
+  }
+  function startRecorder() {
+    stopRecorder(true);
+    const chunks = [];
+    const r = new MediaRecorder(mic, mime ? { mimeType: mime } : undefined);
+    r.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+    r.chunks = chunks;
+    r.start(250);
+    recorder = r;
+    recStarted = performance.now();
+  }
+  /** Stops the recorder; resolves with the audio (or null when discarded). */
+  function stopRecorder(discard) {
+    const r = recorder;
+    recorder = null;
+    if (!r) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      r.onstop = () => resolve(discard ? null : new Blob(r.chunks, { type: r.mimeType || mime || "audio/webm" }));
+      try { r.stop(); } catch { resolve(null); }
+    });
+  }
+  function stopListening() { stopRecorder(true); hearing = false; }
+  function listen(alreadyHearing = false) {
     if (!active) return;
     phase = "listening";
-    heard = ""; interim = "";
-    setState("listening", "Listening");
-    startRec();
+    hearing = alreadyHearing;
+    voicedMs = alreadyHearing ? 300 : 0;
+    runMs = 0; silenceMs = 0;
+    setState("listening", alreadyHearing ? "Hearing you…" : "Listening");
+    startRecorder();
   }
-  rec.onresult = (e) => {
+  const vad = setInterval(() => {
     if (!active) return;
-    interim = "";
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      if (e.results[i].isFinal) heard += e.results[i][0].transcript + " ";
-      else interim += e.results[i][0].transcript;
+    const lv = micLevel();
+    const voiced = lv > Math.max(0.018, noise * 3);
+    if (phase === "listening") {
+      if (!hearing && !voiced) noise = noise * 0.95 + lv * 0.05;   // track the room's background noise
+      if (voiced) {
+        runMs += TICK_MS; voicedMs += TICK_MS; silenceMs = 0;
+        if (!hearing && runMs >= 150) { hearing = true; setState("listening", "Hearing you…"); }
+      } else {
+        runMs = 0; silenceMs += TICK_MS;
+        if (!hearing) voicedMs = 0;
+      }
+      if (hearing && silenceMs >= SILENCE_MS) endOfSpeech();
+      else if (!hearing && performance.now() - recStarted > 12000) startRecorder(); // keep the clip short while waiting
+    } else if (phase === "speaking" && box.checked) {
+      bargeMs = voiced ? bargeMs + TICK_MS : 0;
+      if (bargeMs >= 300) { bargeMs = 0; interrupt(true); }     // headphones: talking over Riya stops her
     }
-    const text = (heard + interim).trim();
-    if (phase === "speaking" || phase === "thinking") {
-      // voice interruption (headphones mode only): two or more words stops Riya
-      if (box.checked && text.split(/\s+/).length >= 2) interrupt(); else return;
-    }
-    if (!text) return;
-    if (!draft) draft = liveBubble("user");
-    draft.set(text);
-    clearTimeout(silenceTimer);
-    silenceTimer = setTimeout(() => {
-      const said = (heard + interim).trim();
-      if (!said || phase !== "listening") return;
-      stopListening();
-      draft = null;
-      submit(said);
-    }, SILENCE_MS);
-  };
-  rec.onend = () => { recOn = false; if (active && (phase === "listening" || box.checked)) startRec(); }; // Chrome stops after silence
-  rec.onerror = (e) => {
-    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-      els.hint.textContent = "Speech recognition was blocked. Allow the microphone and try again.";
-      els.hint.classList.add("error");
-      finish();
-    }
-  };
+  }, TICK_MS);
 
-  function interrupt() {
+  async function endOfSpeech() {
+    const spokenMs = voicedMs;
+    phase = "thinking";
+    setState("thinking", "Got it…");
+    const audio = await stopRecorder(false);
+    hearing = false;
+    if (!active) return;
+    if (!audio || audio.size < 1200) { listen(); return; }
+    let text = "";
+    try {
+      const res = await fetch("/api/free/transcribe", { method: "POST", body: audio,
+        headers: { "Content-Type": (audio.type || "audio/webm").split(";")[0] } });
+      if (!res.ok) throw new Error(`transcription failed (${res.status})`);
+      text = ((await res.json()).text || "").trim();
+    } catch (err) {
+      console.error(err);
+      els.hint.textContent = "I could not hear that clearly. Please say it again.";
+    }
+    if (!active || phase !== "thinking") return;
+    // Whisper invents short phrases for noise ("Thank you."); ignore those after a very short sound.
+    const junk = spokenMs < 500 && /^(thank you|thanks|thanks for watching|you|bye|okay|\.*)[.!]*$/i.test(text);
+    if (!text || junk) { listen(); return; }
+    els.hint.textContent = FREE_HINT;
+    liveBubble("user").set(text);
+    submit(text);
+  }
+
+  function interrupt(byVoice = false) {
     if (phase !== "speaking" && phase !== "thinking") return;
     controller?.abort();
     streamOpen = false;
     sentenceBuf = "";
     pending = 0;
+    clearTimeout(speechWatch);
     speechSynthesis.cancel();
-    heard = ""; interim = "";
-    listen();
+    listen(byVoice === true);
   }
 
   // ----- one seller turn: send to our agent loop, speak the streamed reply, apply tool events
@@ -779,19 +841,22 @@ async function startFree(info, mic) {
   function finish() {
     if (!active) return;
     active = false;
+    clearInterval(vad);
+    clearTimeout(speechWatch);
     stopListening();
     controller?.abort();
     speechSynthesis.cancel();
     mic.getTracks().forEach((t) => t.stop());
     audioCtx.close().catch(() => {});
     removeEventListener("keydown", onKey);
-    els.orb.removeEventListener("click", interrupt);
+    els.orb.removeEventListener("click", onOrb);
     els.orb.classList.remove("clickable");
     endedUI();
   }
   const onKey = (e) => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); interrupt(); } };
+  const onOrb = () => interrupt();
   addEventListener("keydown", onKey);
-  els.orb.addEventListener("click", interrupt);
+  els.orb.addEventListener("click", onOrb);
   els.orb.classList.add("clickable");
 
   call = {
@@ -812,10 +877,10 @@ async function startFree(info, mic) {
 
   callStarted(`Voice: backup mode${voice ? ` · ${voice.name.replace(/\s*-\s*English.*$/i, "").replace(/^Microsoft\s+/i, "")}` : ""}`);
   els.mode.appendChild(label);
-  els.hint.textContent = "Backup voice: tap the circle or press Space to interrupt Riya.";
+  els.hint.textContent = FREE_HINT;
   if (info.reason && info.reason !== "requested") console.info("Fallback voice mode:", info.reason);
 
-  if (query.has("debug")) window.__kam = { submit, interrupt, history };
+  if (query.has("debug")) window.__kam = { submit, interrupt, history, state: () => ({ phase, hearing, noise, level: micLevel(), pending }) };
 
   // Riya opens the call
   history.push({ role: "assistant", content: info.first_message });

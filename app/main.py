@@ -7,6 +7,7 @@ Endpoints
                               "elevenlabs" (primary): returns a short-lived WebRTC token
                               "free" (fallback): browser speech + our Groq agent loop
   POST /api/free/turn    -> one seller turn in fallback mode, streamed as NDJSON events
+  POST /api/free/transcribe -> speech-to-text for fallback mode (Whisper on Groq)
   GET  /api/health       -> liveness check
 
 Run:  uvicorn app.main:app --port 8000
@@ -18,7 +19,7 @@ from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -135,3 +136,38 @@ def free_turn(req: TurnRequest) -> StreamingResponse:
 
     return StreamingResponse(events(), media_type="application/x-ndjson",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ---------------------------------------------------------------- fallback speech-to-text
+MAX_AUDIO_BYTES = 4_000_000
+AUDIO_EXT = {"audio/webm": "webm", "audio/mp4": "mp4", "audio/ogg": "ogg", "audio/wav": "wav", "audio/mpeg": "mp3"}
+# Domain words help Whisper spell what sellers actually say.
+WHISPER_PROMPT = "A Snapdeal seller talking to their account manager about sales, orders, cancellations, stock, restocking, supplier, listings and prices."
+
+
+@app.post("/api/free/transcribe")
+async def free_transcribe(request: Request) -> dict:
+    """Transcribes one spoken seller turn with Whisper (Groq). The browser records it after detecting a pause."""
+    key = _env("GROQ_API_KEY")
+    if not key:
+        raise HTTPException(503, "Transcription is not configured")
+    content_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    if content_type not in AUDIO_EXT:
+        raise HTTPException(415, "Unsupported audio type")
+    audio = await request.body()
+    if not audio:
+        raise HTTPException(400, "Empty audio")
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise HTTPException(413, "Audio too long")
+    async with httpx.AsyncClient(timeout=30) as http:
+        last = None
+        for model in ("whisper-large-v3-turbo", "whisper-large-v3"):  # second model = separate rate limit
+            last = await http.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {key}"},
+                files={"file": (f"speech.{AUDIO_EXT[content_type]}", audio, content_type)},
+                data={"model": model, "language": "en", "temperature": "0", "response_format": "json", "prompt": WHISPER_PROMPT},
+            )
+            if last.status_code == 200:
+                return {"text": (last.json().get("text") or "").strip()}
+    raise HTTPException(502, f"Transcription failed ({last.status_code if last is not None else 'no response'})")
