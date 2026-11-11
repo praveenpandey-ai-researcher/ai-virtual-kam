@@ -475,8 +475,12 @@ const clientTools = {
 //      credits exhausted), or forced with ?mode=free.
 // The data panel, tools and transcript are shared; only the voice layer differs.
 const FORCE_MODE = query.get("mode");
+// Browser echo cancellation is OFF on purpose: while the page is speaking it mutes the microphone almost
+// completely, so the seller could never interrupt. Echo is handled by our own threshold instead
+// (see `echoPeak`). Auto gain is off too, so it cannot amplify the agent's voice from the speakers.
+const MIC = { audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: false } };
 const DEFAULT_HINT = els.hint.textContent;
-const FREE_HINT = "Backup voice: speak after Riya finishes. Tap the circle or press Space to interrupt her.";
+const FREE_HINT = "Speak naturally; you can talk over Riya to interrupt her. The call ends by itself when you say goodbye.";
 const FEED_WAITING = "Call in progress. Riya will bring up your data here as you talk.";
 
 function callStarted(modeLabel) {
@@ -510,7 +514,7 @@ async function startCall() {
   els.hint.textContent = DEFAULT_HINT;
   setState("connecting", "Connecting…");
   try {
-    const mic = await navigator.mediaDevices.getUserMedia({ audio: true }); // ask for mic permission up front
+    const mic = await navigator.mediaDevices.getUserMedia(MIC); // ask for mic permission up front
     const info = await getSession(FORCE_MODE);
     els.transcript.replaceChildren();
     resetFeed(FEED_WAITING);
@@ -544,7 +548,7 @@ async function startElevenLabs(info) {
         call = null;
         addMessage("event", "Premium voice unavailable, switching to backup voice…");
         try {
-          const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const mic = await navigator.mediaDevices.getUserMedia(MIC);
           await startFree(await getSession("free"), mic);
         } catch (err) { showStartError(err); }
         return;
@@ -613,13 +617,6 @@ async function startFree(info, mic) {
   const timeData = new Uint8Array(analyser.fftSize);
   const fakeData = new Uint8Array(48);
 
-  // "I'm on headphones" lets the seller interrupt by voice. Without headphones the microphone
-  // would hear Riya's own voice from the speakers, so by default it is ignored while she speaks.
-  const label = el("label", "bargein");
-  const box = label.appendChild(el("input"));
-  box.type = "checkbox";
-  label.appendChild(el("span", "", " I'm on headphones (let me interrupt by voice)"));
-
   // ----- speaking: sentences are spoken as they stream in
   const utterances = [];        // keep references: Chrome can garbage-collect an utterance and never fire onend
   let speechDeadline = 0, speechWatch = null;
@@ -632,7 +629,12 @@ async function startFree(info, mic) {
     utterances.push(u);
     pending++;
     u.onend = u.onerror = () => { pending = Math.max(0, pending - 1); afterSpeech(); };
-    if (phase !== "speaking") { phase = "speaking"; setState("speaking", "Riya is speaking"); stopListening(); }
+    if (phase !== "speaking") {
+      phase = "speaking";
+      echoPeak = 0; speakingMs = 0; bargeMs = 0;
+      setState("speaking", "Riya is speaking");
+      stopListening();
+    }
     speechSynthesis.speak(u);
     // Watchdog: if the browser never reports the end of speech, move on anyway instead of hanging.
     speechDeadline = Math.max(performance.now(), speechDeadline) + s.length * 95 + 1500;
@@ -652,7 +654,9 @@ async function startFree(info, mic) {
   }
   function flush() { enqueue(sentenceBuf); sentenceBuf = ""; }
   function afterSpeech() {
-    if (!active || pending > 0 || streamOpen) return;
+    // Only relevant while Riya is speaking. Cancelling her speech (an interruption) also fires
+    // "end" events; by then we are already listening and must not restart the recording.
+    if (!active || phase !== "speaking" || pending > 0 || streamOpen) return;
     clearTimeout(speechWatch);
     utterances.length = 0;
     speechDeadline = 0;
@@ -666,6 +670,12 @@ async function startFree(info, mic) {
   const mime = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"].find((t) => MediaRecorder.isTypeSupported(t)) || "";
   let recorder = null, recStarted = 0;
   let noise = 0.008, hearing = false, voicedMs = 0, runMs = 0, silenceMs = 0, bargeMs = 0;
+  // Interrupting by voice works automatically. The risk is Riya hearing herself through the speakers,
+  // so while she talks we track how loud her own voice arrives at the microphone (`echoPeak`) and
+  // only treat something clearly louder as the seller. With headphones echoPeak stays near zero.
+  let echoPeak = 0, speakingMs = 0, bargedIn = false, lastAgentText = "";
+  let idleMs = 0, nudges = 0;                 // silence handling: check in once, then end the call politely
+  const IDLE_NUDGE_MS = 20000;
 
   function micLevel() { // RMS loudness, 0..1
     analyser.getByteTimeDomainData(timeData);
@@ -699,9 +709,9 @@ async function startFree(info, mic) {
     phase = "listening";
     hearing = alreadyHearing;
     voicedMs = alreadyHearing ? 300 : 0;
-    runMs = 0; silenceMs = 0;
+    runMs = 0; silenceMs = 0; idleMs = 0;
     setState("listening", alreadyHearing ? "Hearing you…" : "Listening");
-    startRecorder();
+    if (!(alreadyHearing && recorder)) startRecorder();   // an interruption keeps the clip it already started
   }
   const vad = setInterval(() => {
     if (!active) return;
@@ -718,9 +728,36 @@ async function startFree(info, mic) {
       }
       if (hearing && silenceMs >= SILENCE_MS) endOfSpeech();
       else if (!hearing && performance.now() - recStarted > 12000) startRecorder(); // keep the clip short while waiting
-    } else if (phase === "speaking" && box.checked) {
-      bargeMs = voiced ? bargeMs + TICK_MS : 0;
-      if (bargeMs >= 300) { bargeMs = 0; interrupt(true); }     // headphones: talking over Riya stops her
+      // nobody is talking: ask once, then say goodbye and end the call
+      idleMs = hearing ? 0 : idleMs + TICK_MS;
+      if (idleMs >= IDLE_NUDGE_MS) {
+        idleMs = 0;
+        stopListening();
+        const line = nudges++ === 0 ? `Are you still there, ${info.seller_name || "there"}?`
+          : "It seems you have stepped away, so I will end the call for now. Feel free to call back any time. Goodbye!";
+        if (nudges > 1) endAfterSpeech = true;
+        history.push({ role: "assistant", content: line });
+        liveBubble("agent").set(line);
+        enqueue(line);
+      }
+    } else if (phase === "speaking") {
+      speakingMs += TICK_MS;
+      if (speakingMs <= 700) {                 // learn how loud Riya's own voice is at the microphone
+        echoPeak = Math.max(echoPeak, lv);
+        bargeMs = 0;
+      } else {
+        const over = lv > Math.max(0.045, echoPeak * 1.7 + 0.02);
+        // After calibration the echo estimate may only creep up (1% per tick). A jump would let it
+        // "learn" the start of the seller's own speech as echo and never trigger.
+        if (!over && lv > echoPeak) echoPeak += (lv - echoPeak) * 0.01;
+        // Speech has gaps between words, so count loud ticks with a slow decay instead of resetting.
+        bargeMs = over ? bargeMs + TICK_MS : Math.max(0, bargeMs - TICK_MS / 2);
+        // Start recording at the first loud moment so the seller's opening words are not lost;
+        // drop the clip again if it turns out to be nothing.
+        if (over && !recorder) startRecorder();
+        else if (bargeMs === 0 && recorder) stopRecorder(true);
+        if (bargeMs >= 300) { bargeMs = 0; bargedIn = true; interrupt(true); }  // the seller is talking over Riya
+      }
     }
   }, TICK_MS);
 
@@ -743,6 +780,14 @@ async function startFree(info, mic) {
       els.hint.textContent = "I could not hear that clearly. Please say it again.";
     }
     if (!active || phase !== "thinking") return;
+    if (bargedIn) {
+      bargedIn = false;
+      const mine = new Set(lastAgentText.toLowerCase().match(/[a-z']+/g) || []);
+      const words = text.toLowerCase().match(/[a-z']+/g) || [];
+      const overlap = words.filter((w) => mine.has(w)).length / (words.length || 1);
+      if (words.length >= 4 && overlap >= 0.75) { console.info("Ignored echo of the agent's own voice."); listen(); return; }
+    }
+    nudges = 0;
     // Whisper invents short phrases for noise ("Thank you."); ignore those after a very short sound.
     const junk = spokenMs < 500 && /^(thank you|thanks|thanks for watching|you|bye|okay|\.*)[.!]*$/i.test(text);
     if (!text || junk) { listen(); return; }
@@ -792,6 +837,7 @@ async function startFree(info, mic) {
           if (ev.type === "text") {
             if (!bubble) bubble = liveBubble("agent");
             said += ev.delta;
+            lastAgentText = said;
             bubble.set(said);
             feed(ev.delta);
           } else if (ev.type === "tool") {
@@ -799,6 +845,7 @@ async function startFree(info, mic) {
               if (!said.trim()) {
                 // The data fetch costs one extra LLM round. Fill the gap straight away so there is no dead air.
                 said = "Let me pull up your account. ";
+                lastAgentText = said;
                 bubble = bubble || liveBubble("agent");
                 bubble.set(said);
                 feed(said);
@@ -835,7 +882,11 @@ async function startFree(info, mic) {
       return;
     }
     flush();
-    afterSpeech(); // covers replies with no speech (tool only)
+    if (phase === "thinking") {             // the reply had no speech at all (tool only)
+      if (endAfterSpeech) finish(); else listen();
+    } else {
+      afterSpeech();
+    }
   }
 
   function finish() {
@@ -876,13 +927,13 @@ async function startFree(info, mic) {
   };
 
   callStarted(`Voice: backup mode${voice ? ` · ${voice.name.replace(/\s*-\s*English.*$/i, "").replace(/^Microsoft\s+/i, "")}` : ""}`);
-  els.mode.appendChild(label);
   els.hint.textContent = FREE_HINT;
   if (info.reason && info.reason !== "requested") console.info("Fallback voice mode:", info.reason);
 
-  if (query.has("debug")) window.__kam = { submit, interrupt, history, state: () => ({ phase, hearing, noise, level: micLevel(), pending }) };
+  if (query.has("debug")) window.__kam = { submit, interrupt, history, state: () => ({ phase, hearing, noise, level: micLevel(), pending, echoPeak, bargeMs, speakingMs }) };
 
   // Riya opens the call
+  lastAgentText = info.first_message;
   history.push({ role: "assistant", content: info.first_message });
   liveBubble("agent").set(info.first_message);
   enqueue(info.first_message);

@@ -99,7 +99,8 @@ async def create_session(mode: Literal["auto", "elevenlabs", "free"] = "auto") -
             raise HTTPException(503, reason)
     if not _env("GROQ_API_KEY"):
         raise HTTPException(503, f"No voice service available: {reason}; fallback is not configured")
-    return {"mode": "free", "reason": reason, "first_message": cfg.FIRST_MESSAGE, "agent_name": cfg.KAM_NAME}
+    return {"mode": "free", "reason": reason, "first_message": cfg.FIRST_MESSAGE, "agent_name": cfg.KAM_NAME,
+            "seller_name": cfg.SELLER_NAME}
 
 
 # ---------------------------------------------------------------- fallback agent turn

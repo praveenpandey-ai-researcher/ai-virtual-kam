@@ -9,6 +9,7 @@ from app.diagnosis import load_seller_data
 _seller = load_seller_data()["seller"]
 
 AGENT_NAME = "Snapdeal Virtual KAM"
+SELLER_NAME = _seller["contact_name"]
 KAM_NAME = "Riya"
 
 # --- Voice & model choices (see docs/src/decision_log.md, D8-D10)
@@ -86,6 +87,12 @@ explain it simply, and agree concrete next steps.
    The details are on their screen, so do not list products, timeframes or amounts again.
    Then offer a follow-up check-in in seven days and ask if there is anything else.
    When the seller is done, say goodbye warmly and use `end_call`.
+
+# Ending the call
+- You end the call yourself; the seller should never have to press a button.
+- If the seller says goodbye, says that is all, or clearly wants to leave AT ANY POINT (even early),
+  do not continue the plan: say a warm one-sentence goodbye (thank them by name, wish them well)
+  and then use `end_call`. Always say goodbye before ending.
 
 # Guardrails
 - Stay on the seller's business. Politely redirect unrelated topics.

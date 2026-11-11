@@ -121,3 +121,21 @@ def test_reply_is_cut_at_the_first_question():
 
 def test_typographic_characters_are_made_speakable():
     assert free_agent._speakable("best‑sellers — restock *now*") == "best-sellers ,  restock now"
+
+
+def test_seller_can_end_the_call_at_any_point():
+    early = [{"role": "user", "content": "Actually I have to go, bye."}]
+    assert _offered(early) == ["end_call"]
+    assert "goodbye" in free_agent.stage_hint(early)
+    for phrase in ["Okay thanks, that's all.", "No, nothing else.", "Please end the call", "Have a nice day!"]:
+        assert free_agent.seller_is_leaving([{"role": "user", "content": phrase}]), phrase
+    for phrase in ["My sales dropped", "Yes, my supplier was late", "Should I buy more stock?"]:
+        assert not free_agent.seller_is_leaving([{"role": "user", "content": phrase}]), phrase
+
+
+def test_never_hangs_up_without_a_goodbye():
+    llm = scripted_llm(("", [("end_call", {})]))   # the model ends the call but says nothing
+    events = list(free_agent.run_turn([{"role": "user", "content": "bye"}], llm))
+    spoken = "".join(e["delta"] for e in events if e["type"] == "text")
+    assert "Goodbye" in spoken and "Praveen" in spoken
+    assert events.index(next(e for e in events if e["type"] == "text")) < events.index({"type": "tool", "name": "end_call", "args": {}})

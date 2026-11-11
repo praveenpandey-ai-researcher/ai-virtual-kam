@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any, Callable, Iterator
 
@@ -93,6 +94,20 @@ _STEPS = [
 ]
 
 
+# The seller can end the call at any point, not only after the summary. Detected in code from the
+# seller's last message, so the model is offered `end_call` exactly when it makes sense.
+_FAREWELL = re.compile(
+    r"\b(bye|goodbye|good bye|see you|talk (to you )?later|that'?s all|that is all|that will be all|nothing else|"
+    r"no(thing)? more questions|i'?m done|i am done|have a (good|nice|great) (day|evening|night)|"
+    r"(end|disconnect|hang up|cut) (the |this )?call|i (have|need|got) to go)\b", re.IGNORECASE)
+DEFAULT_GOODBYE = "Thank you for your time, {name}. Have a great day. Goodbye!"
+
+
+def seller_is_leaving(msgs: list[dict[str, Any]]) -> bool:
+    last_user = next((m for m in reversed(msgs) if m["role"] == "user"), None)
+    return bool(last_user and _FAREWELL.search(last_user.get("content") or ""))
+
+
 def _stage(msgs: list[dict[str, Any]]) -> tuple[bool, int, bool]:
     """(data loaded?, seller turns since the data was loaded, summary shown?)"""
     loaded, since, summary = False, 0, False
@@ -108,6 +123,8 @@ def _stage(msgs: list[dict[str, Any]]) -> tuple[bool, int, bool]:
 
 def stage_tools(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     loaded, since, summary = _stage(msgs)
+    if seller_is_leaving(msgs):
+        return [TOOLS["end_call"]]
     if not loaded:
         return [TOOLS["get_seller_diagnosis"]]
     if summary:
@@ -117,6 +134,10 @@ def stage_tools(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def stage_hint(msgs: list[dict[str, Any]]) -> str | None:
     loaded, since, summary = _stage(msgs)
+    if seller_is_leaving(msgs):
+        return ("The seller is ending the call. Say a warm goodbye in one short sentence (thank them by name, wish "
+                "them well; if actions were agreed, mention you will check in in seven days) and call end_call. "
+                "Do not ask another question.")
     if not loaded:
         return None
     if summary:
@@ -250,6 +271,11 @@ def run_turn(history: list[dict[str, Any]],
                     yield {"type": "text", "delta": delta}
                 elif "tool_calls" in ev:
                     calls = ev["tool_calls"]
+            if any(c["name"] == "end_call" for c in calls) and not spoke:
+                # Guard rail: never hang up silently. If the model ended the call without a goodbye, add one.
+                text = DEFAULT_GOODBYE.format(name=cfg.SELLER_NAME)
+                spoke = True
+                yield {"type": "text", "delta": text}
             if not calls:
                 new.append({"role": "assistant", "content": text})
                 break
