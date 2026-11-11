@@ -148,7 +148,9 @@ WHISPER_PROMPTS = {
     "en": "A Snapdeal seller talking to their account manager about sales, orders, cancellations, stock, restocking, supplier, listings and prices.",
     "hi": "Snapdeal seller अपने account manager से बात कर रहा है: sales, orders, stock, cancellation, supplier, listing, price.",
 }
-AUTO_DETECT_MIN_MS = 2500  # language detection is unreliable on very short clips ("yes", "okay", "हाँ")
+# Counted in VOICED time (pauses excluded), so a normal sentence is ~2 s. Below this, language detection is
+# unreliable ("yes", "okay", "हाँ") and the conversation's current language is used instead.
+AUTO_DETECT_MIN_MS = 1200
 
 
 def _lang_code(name: str | None) -> str:
