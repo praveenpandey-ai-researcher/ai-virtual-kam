@@ -25,6 +25,22 @@ FastAPI backend ── /api/diagnosis → Python diagnosis engine (deterministic
 the LLM. The engine compares this month with last month, ranks likely causes, rules out what isn't the
 cause (pricing) and estimates the ₹ impact. The LLM explains and discusses those results in conversation.
 
+## Two voice modes, one brain
+
+| | Primary: ElevenLabs agent | Automatic fallback: free stack |
+|---|---|---|
+| Hearing and speaking | ElevenLabs real-time voice (WebRTC) | The browser's built-in speech recognition and speech synthesis |
+| LLM | Gemini 2.5 Flash (inside the agent) | Open models on Groq's free tier, rotated on rate limits |
+| Agent loop | Managed by ElevenLabs | Our own loop in `app/free_agent.py`, streamed to the browser |
+| When it is used | By default | When ElevenLabs has no credits, cannot issue a token, or hangs up on connect; or with `?mode=free` |
+
+Both modes share the system prompt, the tools, the diagnosis engine and the on-screen experience, so the
+advice is identical. Because smaller open models drift from long prompts, the fallback adds deterministic
+guard rails in code: tools are offered only at the right stage of the call (the model cannot end the call
+before the summary), a one-line next-step hint keeps it on plan, and a reply is cut at its first question.
+
+For the best fallback voice use Microsoft Edge (natural Indian-English voice); headphones allow interrupting by voice.
+
 ## What the agent concludes from the sample data
 
 | Metric | Last month | This month |
@@ -49,7 +65,7 @@ Requires Python 3.10+ and an [ElevenLabs](https://elevenlabs.io) API key with Ag
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env              # add ELEVENLABS_API_KEY
+cp .env.example .env              # add ELEVENLABS_API_KEY and/or GROQ_API_KEY
 python scripts/setup_agent.py     # creates the agent + tools, saves ELEVENLABS_AGENT_ID to .env
 uvicorn app.main:app --port 8000
 ```
@@ -63,10 +79,12 @@ To preview the visuals without a call, open http://localhost:8000/?demo=1.
 |---|---|
 | `app/diagnosis.py` | Diagnosis engine: metrics, rules, ranked findings, recommendations |
 | `app/agent_config.py` | Agent persona, system prompt, tools, voice and LLM (configuration as code) |
-| `app/main.py` | FastAPI: page, diagnosis endpoint, session-token endpoint |
+| `app/main.py` | FastAPI: page, diagnosis endpoint, voice-mode selection, fallback turn endpoint |
+| `app/free_agent.py` | Fallback agent loop on Groq: model rotation, stage guard rails, streaming |
 | `app/static/` | Voice call UI: live transcript, conversation-driven data panel |
 | `app/data/seller_data.json` | Sample seller data from the brief, plus labelled mock assumptions |
 | `scripts/setup_agent.py` | Creates or updates the ElevenLabs agent and tools through the API |
-| `scripts/text_test.py` | Runs scripted conversations against the live agent in text-only mode |
-| `tests/` | Unit tests for the diagnosis engine (`python -m pytest -q`) |
+| `scripts/text_test.py` | Runs scripted conversations against the live ElevenLabs agent in text-only mode |
+| `scripts/fallback_test.py` | Runs a scripted conversation through the fallback agent |
+| `tests/` | Unit tests for the diagnosis engine and the fallback agent loop (`python -m pytest -q`) |
 | `docs/` | PRD and design notes |

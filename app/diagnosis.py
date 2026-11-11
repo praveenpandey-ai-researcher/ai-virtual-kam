@@ -266,6 +266,47 @@ def diagnose(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def agent_view(result: dict[str, Any]) -> dict[str, Any]:
+    """Compact version of the diagnosis for the LLM.
+
+    The full result also feeds the on-screen visuals. The LLM needs only the facts it will talk
+    about, and every token is resent on every turn (and counted against rate limits), so this
+    keeps the same facts at roughly half the size.
+    """
+    last, now, g = result["metrics"]["last_month"], result["metrics"]["this_month"], result["derived"]
+
+    def change(a: float, b: float, fmt) -> str:
+        if a == b:
+            return f"{fmt(a)} (no change)"
+        return f"{fmt(a)} -> {fmt(b)} ({pct_change(a, b) * 100:+.1f}%)"
+
+    return {
+        "seller": {"contact_name": result["seller"]["contact_name"], "business": result["seller"]["name"],
+                   "category": result["seller"]["category"]},
+        "headline": result["headline"],
+        "metrics_last_month_to_this_month": {
+            "sales": change(last["sales"], now["sales"], format_inr),
+            "orders": change(last["orders"], now["orders"], lambda x: str(int(x))),
+            "average_selling_price": change(last["average_selling_price"], now["average_selling_price"], format_inr),
+            "cancellation_rate": f"{last['cancellation_rate']:.0%} -> {now['cancellation_rate']:.0%}",
+            "out_of_stock_products": f"{last['out_of_stock_products']} -> {now['out_of_stock_products']}",
+            "sales_lost": format_inr(g["sales_lost"]),
+        },
+        "findings": [
+            {"title": f["title"], "confidence": f["confidence"], "evidence": f["evidence"],
+             "ask_seller": f.get("questions_to_ask", [])}
+            for f in result["findings"]
+        ],
+        "ruled_out": [{"title": r["title"], "implication": r["implication"]} for r in result["ruled_out"]],
+        "recommendations": [
+            {"action": r["action"], "start_with": r.get("priority_products", []), "timeframe": r["timeframe"],
+             "impact": r["expected_impact_spoken"]}
+            for r in result["recommendations"]
+        ],
+        "rules": result["notes_for_agent"],
+    }
+
+
 def _recommend(findings: list[dict[str, Any]], newly_oos: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_id = {f["id"]: f for f in findings}
     recs: list[dict[str, Any]] = []

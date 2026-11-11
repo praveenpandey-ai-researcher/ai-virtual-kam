@@ -1,37 +1,45 @@
 """FastAPI backend for the Mini AI Voice KAM.
 
 Endpoints
-  GET /                 -> the voice call page
-  GET /api/diagnosis    -> seller metrics + computed diagnosis (used by the agent's client tool)
-  GET /api/session      -> short-lived WebRTC token for the private ElevenLabs agent
-  GET /api/health       -> liveness check
+  GET  /                 -> the voice call page
+  GET  /api/diagnosis    -> seller metrics + computed diagnosis (drives the on-screen visuals)
+  GET  /api/session      -> decides the voice mode for this call:
+                              "elevenlabs" (primary): returns a short-lived WebRTC token
+                              "free" (fallback): browser speech + our Groq agent loop
+  POST /api/free/turn    -> one seller turn in fallback mode, streamed as NDJSON events
+  GET  /api/health       -> liveness check
 
-Run:  uvicorn app.main:app --reload
+Run:  uvicorn app.main:app --port 8000
 """
+import json
 import os
 from pathlib import Path
+from typing import Any, Literal
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
+from app import agent_config as cfg
+from app import free_agent
 from app.diagnosis import diagnose, load_seller_data
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).parent / "static"
 load_dotenv(ROOT / ".env")
 
+ELEVEN = "https://api.elevenlabs.io/v1"
+MIN_ELEVENLABS_CREDITS = 300  # below this a call would die mid-sentence, so use the fallback instead
+
 app = FastAPI(title="Mini AI Voice KAM")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
 def _env(name: str) -> str:
-    value = (os.getenv(name) or "").strip()
-    if not value:
-        raise HTTPException(500, f"{name} is not configured on the server")
-    return value
+    return (os.getenv(name) or "").strip()
 
 
 @app.get("/")
@@ -50,20 +58,80 @@ def get_diagnosis() -> dict:
     return diagnose(load_seller_data())
 
 
-@app.get("/api/session")
-async def create_session() -> dict:
-    """Exchange the server-side API key for a short-lived conversation token.
+# ---------------------------------------------------------------- voice mode selection
+async def _elevenlabs_token() -> tuple[str | None, str]:
+    """Returns (token, reason). token is None when ElevenLabs cannot take a call right now."""
+    key, agent_id = _env("ELEVENLABS_API_KEY"), _env("ELEVENLABS_AGENT_ID")
+    if not key or not agent_id:
+        return None, "ElevenLabs is not configured"
+    headers = {"xi-api-key": key}
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            sub = await http.get(f"{ELEVEN}/user/subscription", headers=headers)
+            if sub.status_code == 200:
+                s = sub.json()
+                remaining = (s.get("character_limit") or 0) - (s.get("character_count") or 0)
+                if remaining < MIN_ELEVENLABS_CREDITS:
+                    return None, f"ElevenLabs credits exhausted ({remaining} left)"
+            # (if the key cannot read the subscription we still try for a token)
+            tok = await http.get(f"{ELEVEN}/convai/conversation/token", params={"agent_id": agent_id}, headers=headers)
+            if tok.status_code != 200:
+                return None, f"ElevenLabs token request failed ({tok.status_code})"
+            return tok.json()["token"], "ok"
+    except httpx.HTTPError as e:
+        return None, f"ElevenLabs unreachable ({type(e).__name__})"
 
-    The agent is private (auth enabled), so the browser never sees the API key and
-    cannot start a call without going through this endpoint.
+
+@app.get("/api/session")
+async def create_session(mode: Literal["auto", "elevenlabs", "free"] = "auto") -> dict:
+    """Picks the voice mode. ElevenLabs is primary; the free stack is the automatic fallback.
+
+    The ElevenLabs agent is private, so the browser never sees the API key: it gets a
+    short-lived conversation token from here.
     """
-    agent_id = _env("ELEVENLABS_AGENT_ID")
-    async with httpx.AsyncClient(timeout=15) as http:
-        r = await http.get(
-            "https://api.elevenlabs.io/v1/convai/conversation/token",
-            params={"agent_id": agent_id},
-            headers={"xi-api-key": _env("ELEVENLABS_API_KEY")},
-        )
-    if r.status_code != 200:
-        raise HTTPException(502, f"ElevenLabs token request failed ({r.status_code})")
-    return {"conversation_token": r.json()["token"]}
+    reason = "requested"
+    if mode != "free":
+        token, reason = await _elevenlabs_token()
+        if token:
+            return {"mode": "elevenlabs", "conversation_token": token}
+        if mode == "elevenlabs":
+            raise HTTPException(503, reason)
+    if not _env("GROQ_API_KEY"):
+        raise HTTPException(503, f"No voice service available: {reason}; fallback is not configured")
+    return {"mode": "free", "reason": reason, "first_message": cfg.FIRST_MESSAGE, "agent_name": cfg.KAM_NAME}
+
+
+# ---------------------------------------------------------------- fallback agent turn
+class ToolFunction(BaseModel):
+    name: str = Field(max_length=64)
+    arguments: str = Field(max_length=4000)
+
+
+class ToolCall(BaseModel):
+    id: str = Field(max_length=80)
+    type: Literal["function"] = "function"
+    function: ToolFunction
+
+
+class Message(BaseModel):
+    role: Literal["user", "assistant", "tool"]  # the system prompt is added server-side, never by the client
+    content: str | None = Field(default=None, max_length=8000)
+    tool_calls: list[ToolCall] | None = None
+    tool_call_id: str | None = Field(default=None, max_length=80)
+
+
+class TurnRequest(BaseModel):
+    history: list[Message] = Field(max_length=80)
+
+
+@app.post("/api/free/turn")
+def free_turn(req: TurnRequest) -> StreamingResponse:
+    """Runs one seller turn through the fallback agent and streams events as NDJSON lines."""
+    history: list[dict[str, Any]] = [m.model_dump(exclude_none=True) for m in req.history]
+
+    def events():
+        for ev in free_agent.run_turn(history):
+            yield json.dumps(ev, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(events(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

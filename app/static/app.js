@@ -10,14 +10,14 @@ import { Conversation } from "https://cdn.jsdelivr.net/npm/@elevenlabs/client@1.
 const $ = (id) => document.getElementById(id);
 const els = {
   btn: $("call-btn"), status: $("status"), orb: $("orb"), wave: $("wave"), hint: $("hint"),
-  transcript: $("transcript"), feed: $("feed"), tooltip: $("tooltip"),
+  transcript: $("transcript"), feed: $("feed"), tooltip: $("tooltip"), mode: $("mode"),
 };
 
 const query = new URLSearchParams(location.search);
 // ?instant=1 (or the OS "reduce motion" setting) skips animations; ?demo=1 plays a scripted preview without a call.
 const INSTANT = query.has("instant") || matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-let conversation = null;
+let call = null;                 // the active call: { end(), meter(speaking) }
 let diagnosis = null;            // set when the agent fetches the data
 let shown = new Set();           // sections already on screen
 let queue = Promise.resolve();   // sections animate one after another, never on top of each other
@@ -98,21 +98,33 @@ function addMessage(kind, text) {
   scrollTranscript();
 }
 
+/** A transcript bubble whose text is updated as it streams in. */
+function liveBubble(kind) {
+  els.transcript.querySelector(".empty")?.remove();
+  const div = el("div", `msg ${kind}`);
+  div.appendChild(el("div", "who", kind === "agent" ? "Riya · Virtual KAM" : "Seller"));
+  const body = div.appendChild(el("span"));
+  els.transcript.appendChild(div);
+  return { set: (text) => { body.textContent = text; scrollTranscript(); } };
+}
+
 // Live voice waveform: Riya's voice while she speaks, the seller's microphone while she listens.
 const BARS = 30;
 for (let i = 0; i < BARS; i++) els.wave.appendChild(el("span"));
+let voiceLoop = false;
+function startVoiceLoop() {
+  if (!voiceLoop) { voiceLoop = true; requestAnimationFrame(animateVoice); }
+}
 function animateVoice() {
-  if (!conversation) {
+  if (!call) {
     [...els.wave.children].forEach((b) => { b.style.height = "4px"; });
     els.orb.style.removeProperty("--level");
+    voiceLoop = false;
     return;
   }
   const speaking = els.orb.dataset.state === "speaking";
   let data = null, volume = 0;
-  try {
-    data = speaking ? conversation.getOutputByteFrequencyData() : conversation.getInputByteFrequencyData();
-    volume = speaking ? conversation.getOutputVolume() : conversation.getInputVolume();
-  } catch { /* not available on every connection type; fall back to a flat line */ }
+  try { ({ data, volume } = call.meter(speaking)); } catch { /* fall back to a flat line */ }
   const bars = els.wave.children;
   for (let i = 0; i < BARS; i++) {
     const k = Math.abs(i - (BARS - 1) / 2) / ((BARS - 1) / 2); // mirror around the centre
@@ -456,65 +468,378 @@ const clientTools = {
 };
 
 // ---------------------------------------------------------------- call control
+// Two voice modes behind one interface, `call = { end(), meter(speaking) }`:
+//   1. ElevenLabs agent (primary): premium real-time voice over WebRTC.
+//   2. Free fallback: the browser's own speech recognition + speech synthesis, with our Groq
+//      agent loop on the server. Used automatically when ElevenLabs is unavailable (for example
+//      credits exhausted), or forced with ?mode=free.
+// The data panel, tools and transcript are shared; only the voice layer differs.
+const FORCE_MODE = query.get("mode");
+const DEFAULT_HINT = els.hint.textContent;
+const FEED_WAITING = "Call in progress. Riya will bring up your data here as you talk.";
+
+function callStarted(modeLabel) {
+  els.btn.textContent = "End call";
+  els.btn.className = "btn btn-end";
+  els.btn.disabled = false;
+  els.mode.textContent = modeLabel;
+  els.mode.classList.remove("hidden");
+  addMessage("event", "Call connected");
+  startVoiceLoop();
+}
+
+async function getSession(mode) {
+  const res = await fetch(`/api/session${mode ? `?mode=${encodeURIComponent(mode)}` : ""}`);
+  if (!res.ok) throw new Error((await res.json()).detail || "Could not start a session");
+  return res.json();
+}
+
+function showStartError(err) {
+  console.error(err);
+  els.hint.textContent = err.name === "NotAllowedError"
+    ? "Microphone access was blocked. Allow it in the browser and try again."
+    : `Could not start the call: ${err.message}`;
+  els.hint.classList.add("error");
+  endedUI(false);
+}
+
 async function startCall() {
   els.btn.disabled = true;
   els.hint.classList.remove("error");
+  els.hint.textContent = DEFAULT_HINT;
   setState("connecting", "Connecting…");
   try {
-    await navigator.mediaDevices.getUserMedia({ audio: true }); // ask for mic permission up front
-    const res = await fetch("/api/session");
-    if (!res.ok) throw new Error((await res.json()).detail || "Could not start a session");
-    const { conversation_token } = await res.json();
-
+    const mic = await navigator.mediaDevices.getUserMedia({ audio: true }); // ask for mic permission up front
+    const info = await getSession(FORCE_MODE);
     els.transcript.replaceChildren();
-    resetFeed("Call in progress. Riya will bring up your data here as you talk.");
-
-    conversation = await Conversation.startSession({
-      conversationToken: conversation_token,
-      connectionType: "webrtc",
-      clientTools,
-      onConnect: () => {
-        setState("listening", "Listening");
-        els.btn.textContent = "End call";
-        els.btn.className = "btn btn-end";
-        els.btn.disabled = false;
-        addMessage("event", "Call connected");
-      },
-      onDisconnect: () => endedUI(),
-      onMessage: ({ source, message }) => {
-        addMessage(source === "ai" ? "agent" : "user", message);
-        if (source === "ai") showFromSpeech(message);
-      },
-      onModeChange: ({ mode }) => {
-        if (conversation) setState(mode === "speaking" ? "speaking" : "listening", mode === "speaking" ? "Riya is speaking" : "Listening");
-      },
-      onError: (msg) => console.error("Conversation error:", msg),
-    });
-    requestAnimationFrame(animateVoice);
+    resetFeed(FEED_WAITING);
+    if (info.mode === "elevenlabs") {
+      mic.getTracks().forEach((t) => t.stop()); // the SDK opens its own stream
+      await startElevenLabs(info);
+    } else {
+      await startFree(info, mic);
+    }
   } catch (err) {
-    console.error(err);
-    els.hint.textContent = err.name === "NotAllowedError"
-      ? "Microphone access was blocked. Allow it in the browser and try again."
-      : `Could not start the call: ${err.message}`;
-    els.hint.classList.add("error");
-    endedUI(false);
+    showStartError(err);
   }
 }
 
+// ---------- mode 1: ElevenLabs agent
+async function startElevenLabs(info) {
+  let heardAgent = false, userEnded = false, dead = false;
+  const conversation = await Conversation.startSession({
+    conversationToken: info.conversation_token,
+    connectionType: "webrtc",
+    clientTools,
+    onConnect: () => {
+      setState("listening", "Listening");
+      callStarted("Voice: ElevenLabs");
+    },
+    onDisconnect: async () => {
+      dead = true;
+      // Connected but hung up before saying anything = the agent is unavailable (e.g. out of credits).
+      // Switch to the free fallback instead of leaving the seller with a dead call.
+      if (!heardAgent && !userEnded) {
+        call = null;
+        addMessage("event", "Premium voice unavailable, switching to backup voice…");
+        try {
+          const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+          await startFree(await getSession("free"), mic);
+        } catch (err) { showStartError(err); }
+        return;
+      }
+      endedUI();
+    },
+    onMessage: ({ source, message }) => {
+      if (source === "ai") heardAgent = true;
+      addMessage(source === "ai" ? "agent" : "user", message);
+      if (source === "ai") showFromSpeech(message);
+    },
+    onModeChange: ({ mode }) => {
+      if (call) setState(mode === "speaking" ? "speaking" : "listening", mode === "speaking" ? "Riya is speaking" : "Listening");
+    },
+    onError: (msg) => console.error("Conversation error:", msg),
+  });
+  if (dead) return; // already switched to the fallback (or ended)
+  call = {
+    end: async () => { userEnded = true; await conversation.endSession(); },
+    meter: (speaking) => ({
+      data: speaking ? conversation.getOutputByteFrequencyData() : conversation.getInputByteFrequencyData(),
+      volume: speaking ? conversation.getOutputVolume() : conversation.getInputVolume(),
+    }),
+  };
+  startVoiceLoop();
+}
+
+// ---------- mode 2: free fallback (browser speech + Groq agent loop on our server)
+/** Picks the most natural English voice the browser offers, preferring Indian English. */
+async function pickVoice() {
+  let voices = speechSynthesis.getVoices();
+  if (!voices.length) {
+    await new Promise((r) => { speechSynthesis.addEventListener("voiceschanged", r, { once: true }); setTimeout(r, 1500); });
+    voices = speechSynthesis.getVoices();
+  }
+  const score = (v) => {
+    const natural = /natural|online|neural/i.test(v.name);
+    if (/neerja/i.test(v.name)) return 100;                       // Edge: natural Indian-English female voice
+    if (/en[-_]IN/i.test(v.lang)) return natural ? 90 : 70;
+    if (/^en/i.test(v.lang) && natural) return 60;
+    if (/google (uk|us) english/i.test(v.name)) return 50;
+    return /^en/i.test(v.lang) ? 20 : 0;
+  };
+  return voices.slice().sort((a, b) => score(b) - score(a))[0] || null;
+}
+
+async function startFree(info, mic) {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR || !window.speechSynthesis) {
+    mic.getTracks().forEach((t) => t.stop());
+    throw new Error("this browser has no built-in speech support. Please use Chrome or Edge.");
+  }
+  const SILENCE_MS = 1200;      // pause that ends the seller's turn
+  const history = [];           // the browser owns the conversation; the server is stateless
+  const voice = await pickVoice();
+  let active = true, phase = "idle", endAfterSpeech = false;
+  let pending = 0, streamOpen = false, sentenceBuf = "", controller = null;
+
+  // microphone level for the waveform
+  const audioCtx = new AudioContext();
+  const analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 128;
+  audioCtx.createMediaStreamSource(mic).connect(analyser);
+  const micData = new Uint8Array(analyser.frequencyBinCount);
+  const fakeData = new Uint8Array(48);
+
+  // "I'm on headphones" lets the seller interrupt by voice. Without headphones the microphone
+  // would hear Riya's own voice from the speakers, so by default it is muted while she speaks.
+  const label = el("label", "bargein");
+  const box = label.appendChild(el("input"));
+  box.type = "checkbox";
+  label.appendChild(el("span", "", " I'm on headphones (let me interrupt by voice)"));
+
+  // ----- speaking: sentences are spoken as they stream in
+  function enqueue(sentence) {
+    const s = sentence.trim();
+    if (!s || !active) return;
+    const u = new SpeechSynthesisUtterance(s);
+    if (voice) { u.voice = voice; u.lang = voice.lang; }
+    u.rate = 1.04;
+    pending++;
+    u.onend = u.onerror = () => { pending = Math.max(0, pending - 1); afterSpeech(); };
+    if (phase !== "speaking") { phase = "speaking"; setState("speaking", "Riya is speaking"); if (!box.checked) stopListening(); }
+    speechSynthesis.speak(u);
+  }
+  function feed(delta) {
+    sentenceBuf += delta;
+    let m;
+    while ((m = sentenceBuf.match(/^([\s\S]*?[.!?])\s+/))) { enqueue(m[1]); sentenceBuf = sentenceBuf.slice(m[0].length); }
+  }
+  function flush() { enqueue(sentenceBuf); sentenceBuf = ""; }
+  function afterSpeech() {
+    if (!active || pending > 0 || streamOpen) return;
+    if (endAfterSpeech) { finish(); return; }
+    listen();
+  }
+
+  // ----- listening: collect speech until the seller pauses
+  const rec = new SR();
+  rec.lang = "en-IN";
+  rec.continuous = true;
+  rec.interimResults = true;
+  let recOn = false, heard = "", interim = "", silenceTimer = null, draft = null;
+  function startRec() { if (!recOn) { try { rec.start(); recOn = true; } catch { /* already started */ } } }
+  function stopListening() { clearTimeout(silenceTimer); if (recOn) { recOn = false; try { rec.abort(); } catch { /* not running */ } } }
+  function listen() {
+    if (!active) return;
+    phase = "listening";
+    heard = ""; interim = "";
+    setState("listening", "Listening");
+    startRec();
+  }
+  rec.onresult = (e) => {
+    if (!active) return;
+    interim = "";
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (e.results[i].isFinal) heard += e.results[i][0].transcript + " ";
+      else interim += e.results[i][0].transcript;
+    }
+    const text = (heard + interim).trim();
+    if (phase === "speaking" || phase === "thinking") {
+      // voice interruption (headphones mode only): two or more words stops Riya
+      if (box.checked && text.split(/\s+/).length >= 2) interrupt(); else return;
+    }
+    if (!text) return;
+    if (!draft) draft = liveBubble("user");
+    draft.set(text);
+    clearTimeout(silenceTimer);
+    silenceTimer = setTimeout(() => {
+      const said = (heard + interim).trim();
+      if (!said || phase !== "listening") return;
+      stopListening();
+      draft = null;
+      submit(said);
+    }, SILENCE_MS);
+  };
+  rec.onend = () => { recOn = false; if (active && (phase === "listening" || box.checked)) startRec(); }; // Chrome stops after silence
+  rec.onerror = (e) => {
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+      els.hint.textContent = "Speech recognition was blocked. Allow the microphone and try again.";
+      els.hint.classList.add("error");
+      finish();
+    }
+  };
+
+  function interrupt() {
+    if (phase !== "speaking" && phase !== "thinking") return;
+    controller?.abort();
+    streamOpen = false;
+    sentenceBuf = "";
+    pending = 0;
+    speechSynthesis.cancel();
+    heard = ""; interim = "";
+    listen();
+  }
+
+  // ----- one seller turn: send to our agent loop, speak the streamed reply, apply tool events
+  async function submit(text, attempt = 0) {
+    if (!active) return;
+    if (attempt === 0) history.push({ role: "user", content: text });
+    phase = "thinking";
+    setState("thinking", "Riya is thinking…");
+    controller = new AbortController();
+    streamOpen = true;
+    let bubble = null, said = "", failed = null;
+    const mySignal = controller.signal;
+    try {
+      const res = await fetch("/api/free/turn", { method: "POST", signal: mySignal,
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ history }) });
+      if (!res.ok) throw new Error(`server error ${res.status}`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const ev = JSON.parse(line);
+          if (ev.type === "text") {
+            if (!bubble) bubble = liveBubble("agent");
+            said += ev.delta;
+            bubble.set(said);
+            feed(ev.delta);
+          } else if (ev.type === "tool") {
+            if (ev.name === "get_seller_diagnosis") {
+              if (!said.trim()) {
+                // The data fetch costs one extra LLM round. Fill the gap straight away so there is no dead air.
+                said = "Let me pull up your account. ";
+                bubble = bubble || liveBubble("agent");
+                bubble.set(said);
+                feed(said);
+              }
+              await clientTools.get_seller_diagnosis();
+            }
+            else if (ev.name === "show_call_summary") clientTools.show_call_summary(ev.args);
+            else if (ev.name === "end_call") endAfterSpeech = true;
+          } else if (ev.type === "done") {
+            history.push(...ev.messages);
+          } else if (ev.type === "error") {
+            failed = ev.message;
+          }
+        }
+      }
+    } catch (err) {
+      if (mySignal.aborted) {                 // interrupted by the seller: keep what was said so far
+        if (said.trim()) history.push({ role: "assistant", content: said.trim() });
+        return;
+      }
+      failed = err.message;
+    }
+    if (!active) return;
+    if (said) showFromSpeech(said);
+    streamOpen = false;
+    if (failed && !said) {
+      // rate limit or network blip: tell the seller, wait, try once more
+      if (attempt < 2) {
+        if (attempt === 0) enqueue("Give me a moment, please.");
+        await new Promise((r) => setTimeout(r, 6000));
+        return submit(text, attempt + 1);
+      }
+      enqueue("Sorry, I'm having trouble connecting right now. Please try again in a minute.");
+      return;
+    }
+    flush();
+    afterSpeech(); // covers replies with no speech (tool only)
+  }
+
+  function finish() {
+    if (!active) return;
+    active = false;
+    stopListening();
+    controller?.abort();
+    speechSynthesis.cancel();
+    mic.getTracks().forEach((t) => t.stop());
+    audioCtx.close().catch(() => {});
+    removeEventListener("keydown", onKey);
+    els.orb.removeEventListener("click", interrupt);
+    els.orb.classList.remove("clickable");
+    endedUI();
+  }
+  const onKey = (e) => { if (e.code === "Space" && e.target === document.body) { e.preventDefault(); interrupt(); } };
+  addEventListener("keydown", onKey);
+  els.orb.addEventListener("click", interrupt);
+  els.orb.classList.add("clickable");
+
+  call = {
+    end: async () => { finish(); },
+    meter: (speaking) => {
+      if (!speaking) {
+        analyser.getByteFrequencyData(micData);
+        const avg = micData.reduce((a, b) => a + b, 0) / micData.length / 255;
+        return { data: micData, volume: Math.min(1, avg * 2.2) };
+      }
+      const t = performance.now() / 1000; // no audio tap on browser speech, so draw a soft synthetic wave
+      for (let i = 0; i < fakeData.length; i++) {
+        fakeData[i] = Math.max(0, 150 * Math.abs(Math.sin(t * 7 + i * 0.55)) * Math.abs(Math.sin(t * 2.3 + i * 0.17)) * (1 - i / 60));
+      }
+      return { data: fakeData, volume: 0.35 + 0.25 * Math.abs(Math.sin(t * 5)) };
+    },
+  };
+
+  callStarted(`Voice: backup mode${voice ? ` · ${voice.name.replace(/\s*-\s*English.*$/i, "").replace(/^Microsoft\s+/i, "")}` : ""}`);
+  els.mode.appendChild(label);
+  els.hint.textContent = "Backup voice: tap the circle or press Space to interrupt Riya.";
+  if (info.reason && info.reason !== "requested") console.info("Fallback voice mode:", info.reason);
+
+  if (query.has("debug")) window.__kam = { submit, interrupt, history };
+
+  // Riya opens the call
+  history.push({ role: "assistant", content: info.first_message });
+  liveBubble("agent").set(info.first_message);
+  enqueue(info.first_message);
+}
+
 function endedUI(showEvent = true) {
-  if (conversation && showEvent) addMessage("event", "Call ended");
-  conversation = null;
+  if (call && showEvent) addMessage("event", "Call ended");
+  call = null;
   setState("idle", "Ready to call");
+  els.mode.classList.add("hidden");
+  els.mode.replaceChildren();
   els.btn.textContent = "Start call";
   els.btn.className = "btn btn-start";
   els.btn.disabled = false;
 }
 
 els.btn.addEventListener("click", async () => {
-  if (conversation) {
+  if (call) {
     els.btn.disabled = true;
-    await conversation.endSession();
-    endedUI();
+    const ending = call;
+    await ending.end();
+    if (call === ending) endedUI();
   } else {
     startCall();
   }
