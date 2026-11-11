@@ -120,3 +120,16 @@ Each entry: decision, why, alternatives considered, and how to explain it.
 - **Guard rails tightened while testing Hindi:** (1) stage hints now follow which recommendations were actually spoken (detected in both languages), not the turn count, because the model sometimes got a step ahead; (2) a reply is cut at three sentences, at its first question, or at a brace (the model was writing tool data as text); tool names are never spoken; (3) the hang-up tool is offered only after the seller has answered the recap or said goodbye.
 - **Tested:** scripted English and Hindi conversations against the live model; real Hindi and English audio through `/api/free/transcribe`; a Hindi sentence played into the browser's fake microphone (detected, transcribed in Devanagari, Hindi voice selected, Hinglish reply).
 - **Not done yet:** Hindi in the ElevenLabs mode. It needs their multilingual speech model and language settings, which cannot be tested until the account has credits.
+
+## D21. Ending the call by understanding, not keywords
+- **Problem:** The call ended only on literal phrases ("bye", "that's all"). Real endings are often not literal ("ok thank you Riya", "नहीं, धन्यवाद"), and the same words can also mean "go on" ("thanks, and what about prices?", "no, my stock is fine").
+- **Decision:** Two tiers. Literal goodbyes are caught by patterns at no cost. If the seller's message merely *looks like* a possible closing remark (contains thanks / no / nothing-type words, is short, has no question mark), a small fast model reads Riya's last line and the seller's reply and answers YES or NO. On YES the main model is offered `end_call` and told to say a one-sentence goodbye; the browser hangs up after the goodbye has been spoken.
+- **Fail-safe:** Any error or doubt means "keep talking". Staying on the line by mistake is recoverable; hanging up by mistake is not.
+- **Cost:** About one second, and only on turns that look like a closing remark. Ordinary turns ("yes, my supplier was late", "okay, what next?") never trigger the check.
+- **Tested live:** "No, thank you Riya", "नहीं, धन्यवाद", "ok thanks… I think I'm good" end the call; "No, my stock is fine", "thanks, yes please go ahead" do not.
+
+## D22. UI redesign and conversation starters
+- **Design:** Soft white cards on a light background, rosy accent, a large call orb with a single "Call" button, and a welcome panel (Riya mascot, greeting, three starter chips) that the data cards replace once the conversation begins. The call panel shrinks during a call so the transcript has room.
+- **Starter chips** ("Check performance", "Explore promotions", "Track orders") are functional: tapping one connects the call and sends that request as the seller's first line, so the seller does not have to think of an opening.
+- **Honesty in the UI:** The reference design said 'You can also say "Call Riya"'. A wake word would need the microphone open before the call, which we do not do, so the line says "Speak naturally, in English or Hindi" instead. The mascot and box mark are original drawings, not a company logo.
+- **Speech clean-up:** Money and percent symbols in model text ("₹1,35,000", "32.5%") are turned into words in code before being spoken.

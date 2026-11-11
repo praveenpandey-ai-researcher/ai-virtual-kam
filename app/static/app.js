@@ -10,7 +10,7 @@ import { Conversation } from "https://cdn.jsdelivr.net/npm/@elevenlabs/client@1.
 const $ = (id) => document.getElementById(id);
 const els = {
   btn: $("call-btn"), status: $("status"), orb: $("orb"), wave: $("wave"), hint: $("hint"),
-  transcript: $("transcript"), feed: $("feed"), tooltip: $("tooltip"), mode: $("mode"),
+  transcript: $("transcript"), feed: $("feed"), tooltip: $("tooltip"), mode: $("mode"), statusSub: $("status-sub"),
 };
 
 const query = new URLSearchParams(location.search);
@@ -138,18 +138,66 @@ function animateVoice() {
 }
 
 // ---------------------------------------------------------------- feed building blocks
-function resetFeed(message) {
+const SVG_NS = "http://www.w3.org/2000/svg";
+function icon(id, cls = "ico-svg") {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("class", cls);
+  svg.setAttribute("aria-hidden", "true");
+  svg.appendChild(document.createElementNS(SVG_NS, "use")).setAttribute("href", `#${id}`);
+  return svg;
+}
+
+// Conversation starters: tapping one connects the call and opens with that request.
+const STARTERS = [
+  ["i-chart", "Check performance", "I want to check how my business performed this month."],
+  ["i-tag", "Explore promotions", "Which promotions can help me get more sales?"],
+  ["i-parcel", "Track orders", "I want to know how my orders are doing this month."],
+];
+let starter = null;
+
+/** Clears the data panel back to the welcome view (before a call) or a waiting view (call in progress). */
+function resetFeed(inCall = false) {
   session++;
   diagnosis = null;
   shown = new Set();
   queue = Promise.resolve();
   focusNode = null;
   scrollTo({ top: 0 });
-  const empty = el("div", "card empty-state");
-  empty.appendChild(el("div", "empty-icon", "◎"));
-  empty.appendChild(el("p", "", message));
-  els.feed.replaceChildren(empty);
+  const w = el("div", "card empty-state welcome");
+  const hero = w.appendChild(el("div", "hero"));
+  hero.appendChild(icon("i-riya", "mascot"));
+  const copy = hero.appendChild(el("div", "hero-copy"));
+  copy.appendChild(el("h1", "", inCall ? "I'm listening 👋" : "Hi there! 👋"));
+  copy.appendChild(el("p", "", inCall
+    ? "Tell me what's on your mind. I'll bring up your account data here as we talk."
+    : "I'm Riya, your Snapdeal Key Account Manager. How can I help you today?"));
+  if (!inCall) {
+    const chips = w.appendChild(el("div", "starters"));
+    for (const [ico, label, line] of STARTERS) {
+      const chip = chips.appendChild(el("button", "starter"));
+      chip.type = "button";
+      chip.appendChild(icon(ico));
+      chip.appendChild(el("span", "", label));
+      chip.addEventListener("click", () => { if (!call) { starter = line; startCall(); } });
+    }
+  }
+  w.appendChild(icon("i-box", "watermark"));
+  els.feed.replaceChildren(w);
 }
+
+function transcriptPlaceholder() {
+  const row = el("div", "empty");
+  row.appendChild(el("span", "empty-ico")).appendChild(icon("i-wave"));
+  row.appendChild(el("span", "", "The conversation will appear here."));
+  els.transcript.replaceChildren(row);
+}
+
+function setCallButton(inCall) {
+  els.btn.replaceChildren(icon(inCall ? "i-phone-off" : "i-phone"), el("span", "", inCall ? "End call" : "Call"));
+  els.btn.className = inCall ? "btn btn-end" : "btn btn-start";
+  els.btn.disabled = false;
+}
+
 
 // Auto-follow: while content is being revealed, glide the page so the newest line stays in view.
 // `focusNode` is whatever is growing right now (the latest card, or the latest action in the plan).
@@ -481,12 +529,11 @@ const FORCE_MODE = query.get("mode");
 const MIC = { audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: false } };
 const DEFAULT_HINT = els.hint.textContent;
 const FREE_HINT = "Speak naturally in English or Hindi; you can talk over Riya to interrupt her. The call ends by itself when you say goodbye.";
-const FEED_WAITING = "Call in progress. Riya will bring up your data here as you talk.";
 
 function callStarted(modeLabel) {
-  els.btn.textContent = "End call";
-  els.btn.className = "btn btn-end";
-  els.btn.disabled = false;
+  setCallButton(true);
+  document.body.classList.add("in-call");   // compact call panel so the transcript has room
+  els.statusSub.classList.add("hidden");
   els.mode.textContent = modeLabel;
   els.mode.classList.remove("hidden");
   addMessage("event", "Call connected");
@@ -501,11 +548,12 @@ async function getSession(mode) {
 
 function showStartError(err) {
   console.error(err);
-  els.hint.textContent = err.name === "NotAllowedError"
+  const message = err.name === "NotAllowedError"
     ? "Microphone access was blocked. Allow it in the browser and try again."
     : `Could not start the call: ${err.message}`;
-  els.hint.classList.add("error");
   endedUI(false);
+  els.hint.textContent = message;
+  els.hint.classList.add("error");
 }
 
 async function startCall() {
@@ -516,8 +564,8 @@ async function startCall() {
   try {
     const mic = await navigator.mediaDevices.getUserMedia(MIC); // ask for mic permission up front
     const info = await getSession(FORCE_MODE);
-    els.transcript.replaceChildren();
-    resetFeed(FEED_WAITING);
+    transcriptPlaceholder();
+    resetFeed(true);
     if (info.mode === "elevenlabs") {
       mic.getTracks().forEach((t) => t.stop()); // the SDK opens its own stream
       await startElevenLabs(info);
@@ -566,6 +614,11 @@ async function startElevenLabs(info) {
     onError: (msg) => console.error("Conversation error:", msg),
   });
   if (dead) return; // already switched to the fallback (or ended)
+  if (starter) {
+    const line = starter;
+    starter = null;
+    setTimeout(() => { if (call) { addMessage("user", line); conversation.sendUserMessage(line); } }, 3500);
+  }
   call = {
     end: async () => { userEnded = true; await conversation.endSession(); },
     meter: (speaking) => ({
@@ -675,6 +728,13 @@ async function startFree(info, mic) {
     utterances.length = 0;
     speechDeadline = 0;
     if (endAfterSpeech) { finish(); return; }
+    if (starter) {                       // the seller tapped a conversation starter
+      const line = starter;
+      starter = null;
+      liveBubble("user").set(line);
+      submit(line);
+      return;
+    }
     phase = "idle";
     setTimeout(() => { if (active && phase === "idle") listen(); }, 250); // let the speaker's echo tail die down
   }
@@ -965,9 +1025,12 @@ function endedUI(showEvent = true) {
   setState("idle", "Ready to call");
   els.mode.classList.add("hidden");
   els.mode.replaceChildren();
-  els.btn.textContent = "Start call";
-  els.btn.className = "btn btn-start";
-  els.btn.disabled = false;
+  document.body.classList.remove("in-call");
+  els.statusSub.classList.remove("hidden");
+  els.hint.textContent = DEFAULT_HINT;
+  els.hint.classList.remove("error");
+  starter = null;
+  setCallButton(false);
 }
 
 els.btn.addEventListener("click", async () => {
@@ -982,7 +1045,9 @@ els.btn.addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------- page load: nothing is shown until a call starts
-resetFeed("Nothing to show yet. Start the call and Riya will bring up your data here as you talk.");
+resetFeed(false);
+transcriptPlaceholder();
+setCallButton(false);
 
 // Scripted preview without a call or credits: http://localhost:8000/?demo=1
 if (query.has("demo")) {
@@ -993,7 +1058,10 @@ if (query.has("demo")) {
     await sleep(1400);
   };
   const d = await (await fetch("/api/diagnosis")).json();
-  resetFeed("Call in progress. Riya will bring up your data here as you talk.");
+  resetFeed(true);
+  document.body.classList.add("in-call");
+  els.statusSub.classList.add("hidden");
+  els.status.textContent = "Preview (no call)";
   await say("agent", `Hi ${d.seller.contact_name}, this is Riya, your Snapdeal account manager. How can I help you today?`);
   await say("user", "My sales have dropped significantly this month. I don't understand why. Can you help me?");
   diagnosis = d;

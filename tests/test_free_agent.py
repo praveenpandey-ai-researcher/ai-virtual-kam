@@ -132,6 +132,8 @@ def test_reply_is_cut_at_the_first_question():
 
 def test_typographic_characters_are_made_speakable():
     assert free_agent._speakable("best‑sellers — restock *now*") == "best-sellers ,  restock now"
+    assert free_agent._speakable("Sales fell 32.5% to ₹1,35,000.") == "Sales fell 32.5 percent to 1 lakh 35 thousand rupees."
+    assert free_agent._speakable("sales ₹56,500 वापस", hindi=True) == "sales 56,500 रुपये वापस"
 
 
 def test_seller_can_end_the_call_at_any_point():
@@ -211,3 +213,46 @@ def test_reply_stops_at_data_and_after_three_sentences():
 
     out = "".join(e["delta"] for e in free_agent.run_turn([{"role": "user", "content": "ok"}], llm=rambling) if e["type"] == "text")
     assert out.strip() == "One. Two is 32.5 percent. Three."
+
+
+def _closing(agent, seller, verdict):
+    asked = []
+
+    def ask(a, s):
+        asked.append((a, s))
+        return verdict
+
+    msgs = [{"role": "assistant", "content": agent}, {"role": "user", "content": seller}]
+    return free_agent.closing_intent(msgs, ask), asked
+
+
+def test_closing_intent_uses_the_model_only_for_ambiguous_closers():
+    # literal goodbye: decided by pattern, model not asked
+    assert _closing("Anything else?", "No, that's all, bye", False) == (True, [])
+    # ordinary turns: model not asked, call continues
+    for line in ["Yes, my supplier delayed two shipments.", "Okay, what should I do?", "Sure, I can do that.", "हाँ, ठीक है"]:
+        assert _closing("Shall we go through the plan?", line, True) == (False, []), line
+    # a question is never a goodbye, even with "thanks" in it
+    assert _closing("Restock first.", "Thanks, and what about my prices?", True) == (False, [])
+    # ambiguous closers: the model decides
+    ended, asked = _closing("Anything else I can help with?", "No, thank you Riya", True)
+    assert ended and asked == [("Anything else I can help with?", "No, thank you Riya")]
+    assert _closing("Did you face a supply problem?", "No, my stock is fine", False)[0] is False
+    assert _closing("और कुछ?", "नहीं, धन्यवाद", True)[0] is True
+
+
+def test_closing_intent_fails_safe():
+    def broken(_a, _s):
+        raise RuntimeError("model down")
+
+    msgs = [{"role": "assistant", "content": "Anything else?"}, {"role": "user", "content": "ok thank you"}]
+    assert free_agent.closing_intent(msgs, broken) is False     # never hang up because of an error
+
+
+def test_wrapping_up_offers_end_call_and_goodbye_hint():
+    llm = scripted_llm(("You're welcome, Praveen. Goodbye!", [("end_call", {})]))
+    msgs = [{"role": "assistant", "content": "Anything else?"}, {"role": "user", "content": "ok thank you"}]
+    events = list(free_agent.run_turn(msgs, llm=llm, leaving=lambda _m: True))
+    assert llm.offered == [["end_call"]]
+    assert "goodbye" in llm.calls[0][-1]["content"]
+    assert {"type": "tool", "name": "end_call", "args": {}} in events

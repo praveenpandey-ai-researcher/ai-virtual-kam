@@ -27,7 +27,7 @@ from typing import Any, Callable, Iterator
 import httpx
 
 from app import agent_config as cfg
-from app.diagnosis import agent_view, diagnose, load_seller_data
+from app.diagnosis import agent_view, diagnose, load_seller_data, spoken_inr
 
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -144,9 +144,9 @@ def _seller_replied_to_summary(msgs: list[dict[str, Any]]) -> bool:
     return shown is not None and any(m["role"] == "user" for m in msgs[shown + 1:])
 
 
-def stage_tools(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def stage_tools(msgs: list[dict[str, Any]], leaving: bool | None = None) -> list[dict[str, Any]]:
     loaded, since, summary, given = _stage(msgs)
-    if seller_is_leaving(msgs):
+    if seller_is_leaving(msgs) if leaving is None else leaving:
         return [TOOLS["end_call"]]
     if not loaded:
         return [TOOLS["get_seller_diagnosis"]]
@@ -157,9 +157,9 @@ def stage_tools(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [TOOLS["show_call_summary"]] if all(given) or since >= SUMMARY_AFTER_SELLER_TURNS else []
 
 
-def stage_hint(msgs: list[dict[str, Any]]) -> str | None:
+def stage_hint(msgs: list[dict[str, Any]], leaving: bool | None = None) -> str | None:
     loaded, since, summary, given = _stage(msgs)
-    if seller_is_leaving(msgs):
+    if seller_is_leaving(msgs) if leaving is None else leaving:
         return ("The seller is ending the call. Say a warm goodbye in one short sentence (thank them by name, wish "
                 "them well; if actions were agreed, mention you will check in in seven days) and call end_call. "
                 "Do not ask another question.")
@@ -206,6 +206,55 @@ def _last_user_text(msgs: list[dict[str, Any]]) -> str:
 def seller_is_leaving(msgs: list[dict[str, Any]]) -> bool:
     text = _last_user_text(msgs)
     return bool(_FAREWELL.search(text) or _FAREWELL_HI.search(text))
+
+
+# --- understanding when the seller is wrapping up
+# Literal goodbyes are caught by the patterns above at no cost. Many real endings are not literal
+# ("ok thank you", "thanks Riya", "नहीं, धन्यवाद"), and the same words can also mean "go on"
+# ("thanks, and what about pricing?"). For those, a small fast model reads the agent's last line and
+# the seller's reply and decides. It only runs when the reply looks like a possible closing remark,
+# so ordinary turns pay no extra latency.
+_MAYBE_CLOSING = re.compile(
+    r"\b(thanks?|thank ?(you|u)|thx|appreciate|no|nope|nothing|i'?m good|all good|all set|that helps|helpful)\b|"
+    r"धन्यवाद|शुक्रिया|थैंक|नहीं|बस|shukriya|dhanyavaad|dhanyawad|nahi|bas\b", re.IGNORECASE)
+_INTENT_MODELS = [("openai/gpt-oss-20b", {"reasoning_effort": "low"}), ("openai/gpt-oss-120b", {"reasoning_effort": "low"})]
+_INTENT_PROMPT = """You decide whether a caller is ENDING a phone call with their account manager.
+Answer YES only if the caller's message is a closing remark and they want nothing more right now
+(examples: "ok thank you", "thanks Riya, that helps", "no, nothing else", "नहीं, धन्यवाद", "theek hai, thanks").
+Answer NO if they are agreeing or acknowledging and expect the manager to continue, answering the
+manager's question, asking something, or raising a new point (examples: "thanks, and what about
+prices?", "no, my stock is fine", "okay, what next?", "sure, I can do that").
+Reply with exactly one word: YES or NO."""
+
+
+def _ask_closing(agent_line: str, seller_line: str) -> bool:
+    key = _groq_key()
+    user = f'Manager said: "{agent_line[-400:]}"\nCaller replied: "{seller_line}"\nIs the caller ending the call?'
+    for model, extra in _INTENT_MODELS:
+        try:
+            r = httpx.post(GROQ_URL, headers={"Authorization": f"Bearer {key}"}, timeout=httpx.Timeout(6, connect=4),
+                           json={"model": model, "temperature": 0, "max_completion_tokens": 80, **extra,
+                                 "messages": [{"role": "system", "content": _INTENT_PROMPT}, {"role": "user", "content": user}]})
+            if r.status_code == 200:
+                return (r.json()["choices"][0]["message"].get("content") or "").strip().upper().startswith("YES")
+        except httpx.HTTPError:
+            continue
+    return False
+
+
+def closing_intent(msgs: list[dict[str, Any]], ask: Callable[[str, str], bool] = _ask_closing) -> bool:
+    """True when the seller is wrapping up the call. If unsure or the check fails, the call continues:
+    staying on the line by mistake is recoverable, hanging up by mistake is not."""
+    if seller_is_leaving(msgs):
+        return True
+    text = _last_user_text(msgs).strip()
+    if not text or len(text.split()) > 14 or "?" in text or not _MAYBE_CLOSING.search(text):
+        return False
+    agent_line = next((m.get("content") or "" for m in reversed(msgs) if m["role"] == "assistant" and m.get("content")), "")
+    try:
+        return bool(ask(agent_line, text))
+    except Exception:  # noqa: BLE001 - any failure means "keep talking"
+        return False
 
 
 def seller_speaks_hindi(msgs: list[dict[str, Any]]) -> bool:
@@ -313,15 +362,27 @@ _STOP = re.compile(r"\?|[{\[]|[.!।](?=\s)")
 _TOOL_NAMES = re.compile(r"\b(get_seller_diagnosis|show_on_screen|show_call_summary|end_call)\b(\(\))?")
 
 
-def _speakable(text: str) -> str:
-    """Removes what must never be read aloud: typographic characters that voices read badly,
-    and tool names (a model that is not offered a tool sometimes writes its name as text)."""
-    return _TOOL_NAMES.sub("", text.translate(_SPEECH_FIXES))
+_MONEY = re.compile(r"₹\s?(\d[\d,]*)(?:\.\d+)?")
+
+
+def _speakable(text: str, hindi: bool = False) -> str:
+    """Makes model text safe to read aloud: drops typographic characters voices read badly and tool
+    names (a model that is not offered a tool sometimes writes its name as text), and turns money and
+    percent symbols into words, because a voice reads "₹1,35,000" digit by digit or skips the symbol."""
+    text = _TOOL_NAMES.sub("", text.translate(_SPEECH_FIXES))
+
+    def money(m: re.Match) -> str:
+        amount = int(m.group(1).replace(",", ""))
+        return f"{m.group(1)} रुपये" if hindi else spoken_inr(amount)
+
+    text = _MONEY.sub(money, text)
+    return text.replace("%", " प्रतिशत" if hindi else " percent")
 
 
 # ---------------------------------------------------------------- agent loop
 def run_turn(history: list[dict[str, Any]], hindi_voice: bool = True, *,
-             llm: Callable[..., Iterator[dict[str, Any]]] = groq_stream) -> Iterator[dict[str, Any]]:
+             llm: Callable[..., Iterator[dict[str, Any]]] = groq_stream,
+             leaving: Callable[[list[dict[str, Any]]], bool] = closing_intent) -> Iterator[dict[str, Any]]:
     """Runs one seller turn. Yields events for the browser:
 
     {"type": "text", "delta": "..."}          spoken text, streamed
@@ -333,10 +394,12 @@ def run_turn(history: list[dict[str, Any]], hindi_voice: bool = True, *,
     new: list[dict[str, Any]] = []
     try:
         spoke = False
+        wrapping_up = leaving(history)   # decided once, from the seller's message that started this turn
+        speak_hindi = seller_speaks_hindi(history) and hindi_voice
         for _ in range(MAX_TOOL_ROUNDS):
             text, calls = "", []
             convo = history + new
-            notes = [n for n in (language_note(convo, hindi_voice), stage_hint(convo)) if n]
+            notes = [n for n in (language_note(convo, hindi_voice), stage_hint(convo, wrapping_up)) if n]
             prompt = messages + new + ([{"role": "system", "content": "\n".join(notes)}] if notes else [])
             asked = False  # a question ends the agent's turn; anything after it is dropped
             sentences = 0
@@ -345,7 +408,7 @@ def run_turn(history: list[dict[str, Any]], hindi_voice: bool = True, *,
             def release(chunk: str) -> Iterator[dict[str, Any]]:
                 nonlocal text, spoke, asked
                 nonlocal sentences
-                chunk = _speakable(chunk)
+                chunk = _speakable(chunk, speak_hindi)
                 if asked or not chunk:
                     return
                 # Guard rails. A reply stops at: (1) its first question, since some models answer themselves
@@ -370,7 +433,7 @@ def run_turn(history: list[dict[str, Any]], hindi_voice: bool = True, *,
                 spoke = True
                 yield {"type": "text", "delta": chunk}
 
-            for ev in llm(prompt, stage_tools(convo)):
+            for ev in llm(prompt, stage_tools(convo, wrapping_up)):
                 if "text" in ev:
                     held += ev["text"]
                     cut = max(held.rfind(" "), held.rfind("\n")) + 1
