@@ -35,9 +35,11 @@ cause (pricing) and estimates the ₹ impact. The LLM explains and discusses tho
 | When it is used | By default | When ElevenLabs has no credits, cannot issue a token, or hangs up on connect; or with `?mode=free` |
 
 Both modes share the system prompt, the tools, the diagnosis engine and the on-screen experience, so the
-advice is identical. Because smaller open models drift from long prompts, the fallback adds deterministic
-guard rails in code: tools are offered only at the right stage of the call (the model cannot end the call
-before the summary), a one-line next-step hint keeps it on plan, and a reply is cut at its first question.
+advice is identical. The conversation is seller-led: the agent answers whatever the seller asks, in the
+seller's own style, and treats the diagnosis plan as a default path. Because smaller open models drift, the
+fallback adds guard rails in code that support the conversation rather than script it: tools are offered
+only at the right stage, plan progress is tracked from what was actually said, account numbers come only
+from the data tool, and a turn can never be silent.
 
 In fallback mode the agent also **matches the seller's language**: speak Hindi or Hinglish and it answers in everyday
 Hinglish (Hindi with the business words in English), switches back when the seller does, and ends the call by

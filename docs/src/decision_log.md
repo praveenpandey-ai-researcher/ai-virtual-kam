@@ -130,6 +130,21 @@ Each entry: decision, why, alternatives considered, and how to explain it.
 
 ## D22. UI redesign and conversation starters
 - **Design:** Soft white cards on a light background, rosy accent, a large call orb with a single "Call" button, and a welcome panel (Riya mascot, greeting, three starter chips) that the data cards replace once the conversation begins. The call panel shrinks during a call so the transcript has room.
-- **Starter chips** ("Check performance", "Explore promotions", "Track orders") are functional: tapping one connects the call and sends that request as the seller's first line, so the seller does not have to think of an opening.
-- **Honesty in the UI:** The reference design said 'You can also say "Call Riya"'. A wake word would need the microphone open before the call, which we do not do, so the line says "Speak naturally, in English or Hindi" instead. The mascot and box mark are original drawings, not a company logo.
+- **Starter chips** were built and then removed at the user's request: a voice call should start with the seller simply talking, not with preset buttons. The mascot stays.
+- **Honesty in the UI:** The reference design said 'You can also say "Call Riya"'. A wake word would need the microphone open before the call, which we do not do, so the line says "Speak naturally, in English or Hindi" instead. The mascot is an original drawing. The Snapdeal mark was redrawn as a vector from the brand image supplied for the assignment (measured outline, 95% pixel overlap with the reference).
 - **Speech clean-up:** Money and percent symbols in model text ("₹1,35,000", "32.5%") are turned into words in code before being spoken.
+
+## D23. Seller-led conversation: answer anything, talk the way the seller talks
+- **Feedback:** The agent felt scripted. It should use the LLM's strength: answer whatever the seller asks and match how they speak.
+- **What was wrong:** My guard rails pushed a fixed plan. Hints said "do step N now", counted turns to decide the step, capped every reply at three sentences, and the prompt said "stay on the seller's business, redirect unrelated topics".
+- **Prompt rewrite (both voice modes):** A persona with experience and warmth; "talk like a person, and like THIS person" (mirror language, formality, pace, length, mood; natural reactions; no call-centre phrases); "you can talk about anything the seller brings up" (selling online in general, ads, pricing, returns, small talk). The diagnosis plan is described as a default path, not a script.
+- **Two honest limits kept:** (1) numbers about this account come only from the data tool; if a figure is not there, say so and still help; (2) for exact Snapdeal policies, fees and dates give general guidance and point to the Seller Panel, never invent specifics. Requests that would hurt the seller (fake reviews) are declined kindly with an honest alternative.
+- **Guard rails changed from directing to supporting:**
+  - Plan progress is detected from what the agent actually said (signal shared, cancellations raised, each recommendation), never from a turn count, so a detour does not advance the plan.
+  - The per-turn note says "FIRST respond to what the seller just said". If the seller asked a question that is not "what should I do", the note contains no plan item at all: answer and stop. The plan resumes when they say okay / what next.
+  - Reply length follows the seller: four sentences normally, seven when they asked for an explanation.
+  - Detection was made strict after a test showed a general answer about sponsored listings being counted as "recommendation 3 given", which triggered the summary early.
+  - A silent turn (the model returned nothing) is retried once and can never reach the seller as silence.
+  - Kept: no invented account numbers, tools gated by stage, a question ends the turn, hang-up only on a real ending.
+- **Tested live:** a casual seller ("hey riya, how's your day going?", "my sales totally tanked"), an off-plan question about sponsored listings, "explain in detail why stock-outs hurt ranking", "what if I buy fake reviews?", then "what should I do first?". She chats, answers each on its own, declines the fake reviews, and returns to the plan only when asked. The standard cooperative flow still runs diagnosis, three recommendations, summary, goodbye.
+- **Trade-off:** More freedom means less predictability. Wording varies between runs (temperature 0.6), and the fixed order of the demo is no longer guaranteed if the seller wanders.
