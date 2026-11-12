@@ -565,44 +565,64 @@ async function startCall() {
 // ---------- mode 1: ElevenLabs agent
 async function startElevenLabs(info) {
   let heardAgent = false, userEnded = false, dead = false;
-  const conversation = await Conversation.startSession({
-    conversationToken: info.conversation_token,
-    connectionType: "webrtc",
-    clientTools,
-    onConnect: () => {
-      setState("listening", "Listening");
-      callStarted("Voice: ElevenLabs");
-    },
-    onDisconnect: async () => {
-      dead = true;
-      // Connected but hung up before saying anything = this account cannot take the call (out of
-      // credits). Move down the chain: the next ElevenLabs account, or the free fallback after the last.
-      if (!heardAgent && !userEnded) {
-        call = null;
-        try {
-          const next = await getSession(FORCE_MODE === "elevenlabs" ? "elevenlabs" : null, info.account);
-          if (next.mode === "elevenlabs") {
-            addMessage("event", "Line busy, reconnecting…");
-            await startElevenLabs(next);
-          } else {
-            addMessage("event", "Premium voice unavailable, switching to backup voice…");
-            await startFree(next, await navigator.mediaDevices.getUserMedia(MIC));
-          }
-        } catch (err) { showStartError(err); }
-        return;
+  let conversation;
+
+  async function tryNext() {
+    call = null;
+    try {
+      const next = await getSession(FORCE_MODE === "elevenlabs" ? "elevenlabs" : null, info.account);
+      if (next.mode === "elevenlabs") {
+        addMessage("event", "Switching to next ElevenLabs account…");
+        await startElevenLabs(next);
+      } else {
+        addMessage("event", "All ElevenLabs accounts exhausted, switching to Groq backup voice…");
+        await startFree(next, await navigator.mediaDevices.getUserMedia(MIC));
       }
-      endedUI();
-    },
-    onMessage: ({ source, message }) => {
-      if (source === "ai") heardAgent = true;
-      addMessage(source === "ai" ? "agent" : "user", message);
-      if (source === "ai") showFromSpeech(message);
-    },
-    onModeChange: ({ mode }) => {
-      if (call) setState(mode === "speaking" ? "speaking" : "listening", mode === "speaking" ? "Riya is speaking" : "Listening");
-    },
-    onError: (msg) => console.error("Conversation error:", msg),
-  });
+    } catch (err) {
+      showStartError(err);
+    }
+  }
+
+  try {
+    conversation = await Conversation.startSession({
+      conversationToken: info.conversation_token,
+      connectionType: "webrtc",
+      clientTools,
+      onConnect: () => {
+        setState("listening", "Listening");
+        callStarted(info.accounts > 1 ? `Voice: ElevenLabs (${info.account + 1}/${info.accounts})` : "Voice: ElevenLabs");
+      },
+      onDisconnect: async () => {
+        dead = true;
+        // Connected but hung up before saying anything = this account cannot take the call (out of
+        // credits). Move down the chain: the next ElevenLabs account, or the free fallback after the last.
+        if (!heardAgent && !userEnded) {
+          await tryNext();
+          return;
+        }
+        endedUI();
+      },
+      onMessage: ({ source, message }) => {
+        if (source === "ai") heardAgent = true;
+        addMessage(source === "ai" ? "agent" : "user", message);
+        if (source === "ai") showFromSpeech(message);
+      },
+      onModeChange: ({ mode }) => {
+        if (call) setState(mode === "speaking" ? "speaking" : "listening", mode === "speaking" ? "Riya is speaking" : "Listening");
+      },
+      onError: (msg) => console.error("Conversation error:", msg),
+    });
+  } catch (err) {
+    console.warn("ElevenLabs startSession failed for account", info.account, err);
+    dead = true;
+    if (!userEnded) {
+      await tryNext();
+      return;
+    }
+    showStartError(err);
+    return;
+  }
+
   if (dead) return; // already switched to the fallback (or ended)
   call = {
     end: async () => { userEnded = true; await conversation.endSession(); },
@@ -984,7 +1004,7 @@ async function startFree(info, mic) {
     },
   };
 
-  callStarted(`Voice: backup mode${voice ? ` · ${voice.name.replace(/\s*-\s*English.*$/i, "").replace(/^Microsoft\s+/i, "")}` : ""}`);
+  callStarted(`Voice: Groq backup${voice ? ` · ${voice.name.replace(/\s*-\s*English.*$/i, "").replace(/^Microsoft\s+/i, "")}` : ""}`);
   els.hint.textContent = FREE_HINT;
   if (info.reason && info.reason !== "requested") console.info("Fallback voice mode:", info.reason);
 

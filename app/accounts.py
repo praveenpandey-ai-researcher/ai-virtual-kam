@@ -15,9 +15,14 @@ The single-account variables ELEVENLABS_API_KEY / ELEVENLABS_AGENT_ID still work
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Awaitable, Callable, NamedTuple
 
 import httpx
+from dotenv import load_dotenv
+
+ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env")
 
 ELEVEN = "https://api.elevenlabs.io/v1"
 MIN_CREDITS = 300  # below this a call would die mid-sentence, so move on to the next account
@@ -61,7 +66,10 @@ async def probe(account: Account) -> tuple[str | None, str]:
             tok = await http.get(f"{ELEVEN}/convai/conversation/token", params={"agent_id": account.agent_id}, headers=headers)
             if tok.status_code != 200:
                 return None, f"token refused ({tok.status_code})"
-            return tok.json()["token"], "ok"
+            token = tok.json().get("token")
+            if not token:
+                return None, "empty token returned"
+            return token, "ok"
     except httpx.HTTPError as e:
         return None, f"unreachable ({type(e).__name__})"
 

@@ -58,3 +58,24 @@ def test_accounts_are_read_from_the_environment(monkeypatch):
     monkeypatch.delenv("ELEVENLABS_API_KEYS"); monkeypatch.delenv("ELEVENLABS_AGENT_IDS")
     monkeypatch.setenv("ELEVENLABS_API_KEY", "solo"); monkeypatch.setenv("ELEVENLABS_AGENT_ID", "agent")
     assert elevenlabs_accounts() == [Account(0, "solo", "agent")]
+
+
+def test_full_chain_all_five_exhausted_results_in_fallback():
+    # 5 accounts, all exhausted
+    states = ["exhausted", "exhausted", "exhausted", "exhausted", "exhausted"]
+    index, token, skipped, probed = pick(states)
+    assert index is None
+    assert token is None
+    assert probed == [0, 1, 2, 3, 4]
+    assert len(skipped) == 5
+    assert all("credits exhausted" in s for s in skipped)
+
+
+def test_chain_picks_later_account_when_earlier_ones_exhausted():
+    # Accounts 1, 2, 3 exhausted, account 4 ok
+    states = ["exhausted", "exhausted", "exhausted", "ok", "exhausted"]
+    index, token, skipped, probed = pick(states)
+    assert index == 3
+    assert token == "token3"
+    assert probed == [0, 1, 2, 3]
+    assert len(skipped) == 3
