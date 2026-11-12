@@ -402,3 +402,7 @@ body.in-call .status { font-size: 21px; }
 body.in-call .btn { min-width: 210px; padding: 13px 30px; font-size: 18px; }
 body.in-call .hint { margin: 12px 0 16px; font-size: 13.5px; }
 body.in-call .call { padding-top: 22px; }
+
+/* ---- brand mark colours (the symbol draws with currentColor) and welcome panel without chips */
+.watermark { color: var(--accent); }
+.hero { border-bottom: 0; padding-bottom: 0; }

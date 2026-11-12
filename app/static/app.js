@@ -147,14 +147,6 @@ function icon(id, cls = "ico-svg") {
   return svg;
 }
 
-// Conversation starters: tapping one connects the call and opens with that request.
-const STARTERS = [
-  ["i-chart", "Check performance", "I want to check how my business performed this month."],
-  ["i-tag", "Explore promotions", "Which promotions can help me get more sales?"],
-  ["i-parcel", "Track orders", "I want to know how my orders are doing this month."],
-];
-let starter = null;
-
 /** Clears the data panel back to the welcome view (before a call) or a waiting view (call in progress). */
 function resetFeed(inCall = false) {
   session++;
@@ -171,16 +163,6 @@ function resetFeed(inCall = false) {
   copy.appendChild(el("p", "", inCall
     ? "Tell me what's on your mind. I'll bring up your account data here as we talk."
     : "I'm Riya, your Snapdeal Key Account Manager. How can I help you today?"));
-  if (!inCall) {
-    const chips = w.appendChild(el("div", "starters"));
-    for (const [ico, label, line] of STARTERS) {
-      const chip = chips.appendChild(el("button", "starter"));
-      chip.type = "button";
-      chip.appendChild(icon(ico));
-      chip.appendChild(el("span", "", label));
-      chip.addEventListener("click", () => { if (!call) { starter = line; startCall(); } });
-    }
-  }
   w.appendChild(icon("i-box", "watermark"));
   els.feed.replaceChildren(w);
 }
@@ -614,11 +596,6 @@ async function startElevenLabs(info) {
     onError: (msg) => console.error("Conversation error:", msg),
   });
   if (dead) return; // already switched to the fallback (or ended)
-  if (starter) {
-    const line = starter;
-    starter = null;
-    setTimeout(() => { if (call) { addMessage("user", line); conversation.sendUserMessage(line); } }, 3500);
-  }
   call = {
     end: async () => { userEnded = true; await conversation.endSession(); },
     meter: (speaking) => ({
@@ -728,13 +705,6 @@ async function startFree(info, mic) {
     utterances.length = 0;
     speechDeadline = 0;
     if (endAfterSpeech) { finish(); return; }
-    if (starter) {                       // the seller tapped a conversation starter
-      const line = starter;
-      starter = null;
-      liveBubble("user").set(line);
-      submit(line);
-      return;
-    }
     phase = "idle";
     setTimeout(() => { if (active && phase === "idle") listen(); }, 250); // let the speaker's echo tail die down
   }
@@ -1029,7 +999,6 @@ function endedUI(showEvent = true) {
   els.statusSub.classList.remove("hidden");
   els.hint.textContent = DEFAULT_HINT;
   els.hint.classList.remove("error");
-  starter = null;
   setCallButton(false);
 }
 

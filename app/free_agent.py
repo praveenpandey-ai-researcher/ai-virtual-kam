@@ -37,6 +37,7 @@ MODELS: list[tuple[str, dict[str, Any]]] = [
     ("openai/gpt-oss-20b", {"reasoning_effort": "low"}),
     ("qwen/qwen3.8-27b", {"reasoning_effort": "none"}),
 ]
+FALLBACK_TEMPERATURE = 0.6   # natural, varied phrasing; facts stay fixed because they come from the tool
 MAX_TOOL_ROUNDS = 4          # safety cap on tool -> LLM -> tool loops within one seller turn
 MAX_RETRY_WAIT_SECS = 8      # if every model is rate-limited, wait at most this long once
 
@@ -56,10 +57,12 @@ def _fallback_prompt(prompt: str) -> str:
 # Voice output (strict)
 - Your words are read aloud by a text-to-speech voice. Plain spoken sentences only: no markdown,
   asterisks, bullet points, emojis or headings.
-- HARD LIMIT: at most two sentences and about 35 words per reply. Never give two recommendations
-  in one reply; give one, then stop and let the seller respond.
+- Keep replies conversational: usually one to three sentences. Give one recommendation per
+  reply, then stop and let the seller respond. Explain at more length only when they ask.
 - Call `show_call_summary` only after you have given all the recommendations and the seller has
   agreed. Do not announce it.
+- Once you have the account data, you have it for the whole call. Never say again that you are
+  pulling up, checking or confirming the account.
 
 # Language: match the seller
 - Reply in the language of the seller's most recent message. English gets English.
@@ -94,38 +97,60 @@ TOOLS["end_call"] = _fn("end_call", "End the call after the seller has said good
 # the call by themselves). Instead of hoping the prompt holds, the conversation stage is computed
 # in code from the history, and it decides (a) which tools the model is even offered and (b) a
 # one-line "next step" hint. The model still chooses its words and adapts to the seller.
-SUMMARY_AFTER_SELLER_TURNS = 6   # safety net: offer the summary tool by now even if a recommendation was not detected
-MAX_SENTENCES = 3                # hard cap on one spoken reply
+SUMMARY_AFTER_SELLER_TURNS = 12  # safety net: offer the summary tool by now even if a recommendation was not detected
+MAX_SENTENCES = 4                # hard cap on one spoken reply...
+MAX_SENTENCES_EXPLAIN = 7        # ...unless the seller asked for an explanation
+# The seller asked a question or asked to hear more: a longer answer is welcome.
+_WANTS_DETAIL = re.compile(
+    r"\?|\b(explain|detail|elaborate|tell me (more|about)|how (do|does|can|should|to)|why|what (is|are|about|if)|"
+    r"which|difference|meaning|example)\b|समझा|विस्तार|कैसे|क्यों|क्या है|बताइए|बताओ|बताइये|मतलब|"
+    r"\b(samjha|kaise|kyun|kyon|batao|bataiye|matlab)", re.IGNORECASE)
 
-_BEFORE_PLAN = [
-    "Share the key signal (orders down, price unchanged so pricing is not the cause, out-of-stock products up) "
-    "and ask ONE question about supply or restocking. Do not recommend anything yet.",
-    "Ask ONE question about the rise in cancellations (were they cancelled by the seller because stock ran out?). "
-    "Do not recommend anything yet.",
-    "Explain in one or two sentences how the stock-outs connect the problems (fewer orders, more cancellations, "
-    "likely lower visibility), then offer to go through the plan.",
-]
-# How we recognise that a recommendation has been spoken (English and Hinglish, either script).
+# What we recognise in the agent's own words (English and Hinglish, either script).
+_SIGNAL_SHARED = re.compile(r"out[- ]of[- ]stock|stock-?outs?|स्टॉक|\bstock\b", re.IGNORECASE)
+_CANCELLATIONS_RAISED = re.compile(r"cancel|कैंसल|कैन्सल|कैंसिल|रद्द", re.IGNORECASE)
 _REC_GIVEN = [
-    re.compile(r"(restock|रीस्टॉक).*(best-?sellers?|बेस्ट|first|पहले|48|reorder|रीऑर्डर)|"
-               r"(best-?sellers?|बेस्ट).*(restock|रीस्टॉक)|reorder alert", re.IGNORECASE | re.DOTALL),
+    # 1: restock + something only the actual recommendation contains (a product, the timeframe, the reorder alert)
+    re.compile(r"(?=.*(restock|रीस्टॉक|फिर से stock|दोबारा stock))"
+               r"(?=.*(water bottle|tawa|storage jar|48|72|two to three days|2-3 (days|दिन)|reorder|रीऑर्डर|"
+               r"दो[- ]तीन दिन|घंटे))", re.IGNORECASE | re.DOTALL),
+    # 2: keep listings truthful: daily stock updates or pausing listings at zero
     re.compile(r"stock counts?|स्टॉक काउंट|pause.{0,25}listing|listing.{0,25}(pause|पॉज़|पाज़|पॉज)|लिस्टिंग.{0,25}(pause|पॉज़|पाज़|पॉज)|"
                r"small buffer|बफ़र|बफर", re.IGNORECASE | re.DOTALL),
-    re.compile(r"promotion|sponsored|sale event|प्रमोशन|स्पॉन्सर", re.IGNORECASE),
+    # 3: an instruction to run a promotion once stock is back (not an explanation of what promotions are)
+    re.compile(r"(?=.*(run|launch|start|join|चला|शुरू).{0,45}(promotion|sponsored|sale event|प्रमोशन|स्पॉन्सर))"
+               r"(?=.*(restock|रीस्टॉक|back in stock|stock is back|stock (वापस|आने|भरने)|स्टॉक (वापस|आने|भरने|फिर)))",
+               re.IGNORECASE | re.DOTALL),
 ]
-_REC_STEP = [
-    "Give recommendation 1 ONLY (restock the out-of-stock best-sellers first: name the top products, the "
-    "timeframe and the rough impact). Then stop.",
-    "Give recommendation 2 ONLY (stop cancellations at the source: update stock counts daily, pause listings at "
-    "zero stock). Then stop.",
-    "Give recommendation 3 ONLY (after restocking, a short promotion or sponsored listing to rebuild visibility), "
+# The seller is asking what to do / to carry on: this is a request for the next step of the plan.
+_WANTS_PLAN = re.compile(
+    r"what (should|do|can|shall) (i|we) do|what('s| is)? next|next step|what else|how (do|can|should) (i|we) (fix|solve|improve|recover)|"
+    r"go on|go ahead|carry on|continue|tell me the plan|the plan|what do you (suggest|recommend)|any (suggestion|advice)|"
+    r"क्या करूँ|क्या करूं|क्या करना|क्या करें|आगे|और क्या|बताइए क्या|सुझाव|kya kar|aage|aur kya|sujhav", re.IGNORECASE)
+_OPEN_ITEMS = [
+    "share the key signal WITH its numbers (how much orders or sales fell, the price is unchanged so pricing is "
+    "not the cause, out-of-stock products went from how many to how many) and ask ONE question about supply or "
+    "restocking. Do not recommend anything yet.",
+    "ask ONE question about the rise in cancellations (were they cancelled by the seller because stock ran out?).",
+    "connect the dots in one sentence if you have not yet (stock-outs led to fewer orders, more cancellations and "
+    "likely lower visibility), then give recommendation 1 ONLY: restock the out-of-stock best-sellers first (name "
+    "the top products, the timeframe and the rough impact).",
+    "give recommendation 2 ONLY: stop cancellations at the source (update stock counts daily, pause listings at "
+    "zero stock).",
+    "give recommendation 3 ONLY: after restocking, a short promotion or sponsored listing to rebuild visibility; "
     "then ask if the seller is comfortable with the plan.",
 ]
 
 
 def _stage(msgs: list[dict[str, Any]]) -> tuple[bool, int, bool, list[bool]]:
-    """(data loaded?, seller turns since the data was loaded, summary shown?, which recommendations were given)"""
-    loaded, since, summary, given = False, 0, False, [False, False, False]
+    """(data loaded?, seller turns since the data was loaded, summary shown?, plan items done)
+
+    Plan items: [key signal shared, cancellations raised, recommendation 1, 2, 3]. Each is detected
+    from what the agent actually said, never from a turn count, so a detour (the seller asking about
+    ads, chatting, pushing back) does not move the plan forward.
+    """
+    loaded, since, summary, done = False, 0, False, [False] * 5
+    checks = [_SIGNAL_SHARED, _CANCELLATIONS_RAISED, *_REC_GIVEN]
     for m in msgs:
         for tc in m.get("tool_calls") or []:
             name = tc["function"]["name"]
@@ -134,8 +159,10 @@ def _stage(msgs: list[dict[str, Any]]) -> tuple[bool, int, bool, list[bool]]:
         if loaded and m["role"] == "user":
             since += 1
         if loaded and m["role"] == "assistant" and m.get("content"):
-            given = [g or bool(rx.search(m["content"])) for g, rx in zip(given, _REC_GIVEN)]
-    return loaded, since, summary, given
+            done = [d or bool(rx.search(m["content"])) for d, rx in zip(done, checks)]
+    if any(done[2:]):
+        done[0] = done[1] = True          # once advice has started, the diagnosis questions are behind us
+    return loaded, since, summary, done
 
 
 def _seller_replied_to_summary(msgs: list[dict[str, Any]]) -> bool:
@@ -145,7 +172,8 @@ def _seller_replied_to_summary(msgs: list[dict[str, Any]]) -> bool:
 
 
 def stage_tools(msgs: list[dict[str, Any]], leaving: bool | None = None) -> list[dict[str, Any]]:
-    loaded, since, summary, given = _stage(msgs)
+    loaded, since, summary, done = _stage(msgs)
+    given = done[2:]
     if seller_is_leaving(msgs) if leaving is None else leaving:
         return [TOOLS["end_call"]]
     if not loaded:
@@ -158,7 +186,8 @@ def stage_tools(msgs: list[dict[str, Any]], leaving: bool | None = None) -> list
 
 
 def stage_hint(msgs: list[dict[str, Any]], leaving: bool | None = None) -> str | None:
-    loaded, since, summary, given = _stage(msgs)
+    """Notes for the model about where the call stands. Context, not a script: the seller leads."""
+    loaded, _since, summary, done = _stage(msgs)
     if seller_is_leaving(msgs) if leaving is None else leaving:
         return ("The seller is ending the call. Say a warm goodbye in one short sentence (thank them by name, wish "
                 "them well; if actions were agreed, mention you will check in in seven days) and call end_call. "
@@ -166,20 +195,27 @@ def stage_hint(msgs: list[dict[str, Any]], leaving: bool | None = None) -> str |
     if not loaded:
         return None
     if summary and _seller_replied_to_summary(msgs):
-        step = ("If the seller has nothing more (for example they say no, that is all, or thank you), say a warm "
-                "one-sentence goodbye and call end_call. If they ask something, answer it briefly.")
+        nxt = ("if the seller has nothing more (for example they say no, that is all, or thank you), say a warm "
+               "one-sentence goodbye and call end_call.")
     elif summary:
-        step = ("Give a recap of two sentences at most, offer a follow-up check-in in seven days and ask if there is "
-                "anything else. Then stop and wait for the seller's answer.")
-    elif since < len(_BEFORE_PLAN) and not any(given):
-        step = _BEFORE_PLAN[since]
-    elif not all(given):
-        step = _REC_STEP[given.index(False)]
+        nxt = ("give a recap of two sentences at most, offer a follow-up check-in in seven days and ask if there is "
+               "anything else. Then stop and wait for the seller's answer.")
+    elif not all(done):
+        nxt = _OPEN_ITEMS[done.index(False)]
     else:
-        step = ("All three recommendations are given. If the seller is comfortable with the plan, call the "
-                "show_call_summary tool now (do not write it as text). Otherwise answer their concern briefly.")
-    return ("Suggested next step. If the seller asked a question, disagreed or changed topic, answer that first in "
-            "one or two sentences, then continue with this step: " + step)
+        nxt = ("all three recommendations are given. If the seller is comfortable with the plan, call the "
+               "show_call_summary tool now (do not write it as text).")
+    asked = _last_user_text(msgs)
+    if _WANTS_DETAIL.search(asked) and not _WANTS_PLAN.search(asked) and not (summary and _seller_replied_to_summary(msgs)):
+        return ("Call notes (context, not a script). FIRST respond to what the seller just said. They asked you "
+                "something: answer exactly that, naturally and helpfully, in their style, and then stop. Do NOT add a "
+                "recommendation, a next step or a new question about the account in this reply; you will come back "
+                "to the plan when they are ready.")
+    return ("Call notes (context, not a script). FIRST respond to what the seller just said. If they asked a "
+            "question about anything, made small talk, pushed back or changed topic, answer THAT naturally and "
+            "fully, in their style, and do not squeeze the plan into the same reply. Only when they are ready to "
+            "move on (they answered your question, or said okay, go on, what next, what should I do), continue "
+            "with the next open item of the plan: " + nxt)
 
 
 # The seller can end the call at any point, not only after the summary. Detected in code from the
@@ -219,8 +255,10 @@ _MAYBE_CLOSING = re.compile(
     r"धन्यवाद|शुक्रिया|थैंक|नहीं|बस|shukriya|dhanyavaad|dhanyawad|nahi|bas\b", re.IGNORECASE)
 _INTENT_MODELS = [("openai/gpt-oss-20b", {"reasoning_effort": "low"}), ("openai/gpt-oss-120b", {"reasoning_effort": "low"})]
 _INTENT_PROMPT = """You decide whether a caller is ENDING a phone call with their account manager.
-Answer YES only if the caller's message is a closing remark and they want nothing more right now
-(examples: "ok thank you", "thanks Riya, that helps", "no, nothing else", "नहीं, धन्यवाद", "theek hai, thanks").
+Answer YES if the caller's message is a closing remark: thanks or appreciation with no request, no
+question and nothing they want next (examples: "ok thank you", "thanks Riya, that helps", "cool, will
+do. thanks a lot, that's really helpful", "no, nothing else", "नहीं, धन्यवाद", "theek hai, thanks").
+People usually end a call exactly like this, even if the manager had more to say.
 Answer NO if they are agreeing or acknowledging and expect the manager to continue, answering the
 manager's question, asking something, or raising a new point (examples: "thanks, and what about
 prices?", "no, my stock is fine", "okay, what next?", "sure, I can do that").
@@ -314,7 +352,7 @@ def groq_stream(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> 
     for attempt in range(2):
         retry_after = 0.0
         for model, extra in MODELS:
-            body = {"model": model, "messages": messages, "temperature": cfg.TEMPERATURE,
+            body = {"model": model, "messages": messages, "temperature": FALLBACK_TEMPERATURE,
                     "stream": True, "max_completion_tokens": 400, **extra}
             if tools:
                 body["tools"] = tools
@@ -396,6 +434,7 @@ def run_turn(history: list[dict[str, Any]], hindi_voice: bool = True, *,
         spoke = False
         wrapping_up = leaving(history)   # decided once, from the seller's message that started this turn
         speak_hindi = seller_speaks_hindi(history) and hindi_voice
+        max_sentences = MAX_SENTENCES_EXPLAIN if _WANTS_DETAIL.search(_last_user_text(history)) else MAX_SENTENCES
         for _ in range(MAX_TOOL_ROUNDS):
             text, calls = "", []
             convo = history + new
@@ -418,10 +457,10 @@ def run_turn(history: list[dict[str, Any]], hindi_voice: bool = True, *,
                     if m.group() in "{[":
                         chunk, asked = chunk[:m.start()].rstrip(" ("), True
                     elif m.group().startswith("?"):
-                        chunk, asked = chunk[:m.start() + 1], True
+                        chunk, asked = chunk[:m.start() + 1], True   # a question hands the turn to the seller
                     else:
                         sentences += 1
-                        if sentences >= MAX_SENTENCES:
+                        if sentences >= max_sentences:
                             chunk, asked = chunk[:m.start() + 1], True
                     if asked:
                         break
@@ -444,6 +483,18 @@ def run_turn(history: list[dict[str, Any]], hindi_voice: bool = True, *,
             yield from release(held)
             if not text.strip():
                 text = ""
+            if not text and not calls and not spoke:
+                # Guard rail: the model returned nothing. Ask once more, plainly; a call must never go silent.
+                retry = prompt + [{"role": "system", "content": "Reply to the seller now, in one or two natural spoken sentences."}]
+                held = ""
+                for ev in llm(retry, []):
+                    if "text" in ev:
+                        held += ev["text"]
+                yield from release(held)
+                if not text.strip():
+                    text = "जी, एक बार फिर बताइए?" if speak_hindi else "Sorry, I missed that. Could you say it once more?"
+                    spoke = True
+                    yield {"type": "text", "delta": text}
             if any(c["name"] == "end_call" for c in calls) and not spoke:
                 # Guard rail: never hang up silently. If the model ended the call without a goodbye, add one.
                 hindi = seller_speaks_hindi(history) and hindi_voice

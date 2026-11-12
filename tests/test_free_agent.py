@@ -89,35 +89,46 @@ def _offered(msgs):
     return [t["function"]["name"] for t in free_agent.stage_tools(msgs)]
 
 
+def _said(text):
+    return {"role": "assistant", "content": text}
+
+
+USER = {"role": "user", "content": "ok"}
+LOADED = [USER, _call("get_seller_diagnosis")]
+SIGNAL = _said("Your orders fell and eighteen products are out of stock. Any supply problem?")
+CANCELS = _said("Were most of the cancellations yours?")
+RECS = [_said("Restock your best-sellers first, like the water bottle, within two to three days."),
+        _said("Update stock counts daily and pause listings at zero."),
+        _said("Once you have restocked, run a short promotion on those best-sellers.")]
+
+
 def test_tools_are_gated_by_stage():
-    user = {"role": "user", "content": "ok"}
-    assert _offered([user]) == ["get_seller_diagnosis"]
-    loaded = [user, _call("get_seller_diagnosis")]
-    assert _offered(loaded) == []  # cannot summarise or hang up early
-    late = loaded + [user] * free_agent.SUMMARY_AFTER_SELLER_TURNS
-    assert _offered(late) == ["show_call_summary"]
-    # ...or as soon as all three recommendations have actually been spoken
-    said = lambda text: {"role": "assistant", "content": text}
-    recs = loaded + [said("Restock your best-sellers first."), said("Update stock counts daily and pause listings at zero."), said("Then run a short promotion.")]
-    assert _offered(recs) == ["show_call_summary"]
-    assert _offered(recs[:-1]) == []
-    shown = late + [_call("show_call_summary")]
+    assert _offered([USER]) == ["get_seller_diagnosis"]
+    assert _offered(LOADED) == []                                   # cannot summarise or hang up early
+    assert _offered(LOADED + [SIGNAL, CANCELS] + RECS[:2]) == []
+    done = LOADED + [SIGNAL, CANCELS] + RECS
+    assert _offered(done) == ["show_call_summary"]                  # all three recommendations were spoken
+    shown = done + [_call("show_call_summary")]
     assert _offered(shown) == []                                    # not in the same turn as the summary
     assert _offered(shown + [{"role": "user", "content": "no"}]) == ["end_call"]
+    # safety net: after many turns the summary is offered even if a recommendation was not detected
+    assert _offered(LOADED + [USER] * free_agent.SUMMARY_AFTER_SELLER_TURNS) == ["show_call_summary"]
 
 
-def test_stage_hints_follow_the_plan():
-    user = {"role": "user", "content": "ok"}
-    loaded = [user, _call("get_seller_diagnosis")]
-    assert free_agent.stage_hint([user]) is None
-    assert "supply or restocking" in free_agent.stage_hint(loaded)
-    assert "cancellations" in free_agent.stage_hint(loaded + [user])
-    assert "recommendation 1 ONLY" in free_agent.stage_hint(loaded + [user] * 3)
-    # hints follow what was actually said, not the turn count
-    ahead = loaded + [user, {"role": "assistant", "content": "पहले अपने बेस्ट-सेलर्स को रीस्टॉक करें।"}]
-    assert "recommendation 2 ONLY" in free_agent.stage_hint(ahead)
-    assert "wait for the seller" in free_agent.stage_hint(loaded + [_call("show_call_summary")])
-    assert "call end_call" in free_agent.stage_hint(loaded + [_call("show_call_summary"), user])
+def test_stage_hints_follow_what_was_said_not_the_turn_count():
+    hint = free_agent.stage_hint
+    assert hint([USER]) is None
+    assert "supply or restocking" in hint(LOADED)
+    # a detour (the seller asks about ads, chats, pushes back) does not advance the plan
+    assert "supply or restocking" in hint(LOADED + [USER, _said("Sponsored listings are paid placements."), USER, USER])
+    assert "cancellations" in hint(LOADED + [SIGNAL, USER])
+    assert "recommendation 1 ONLY" in hint(LOADED + [SIGNAL, USER, CANCELS, USER])
+    assert "recommendation 2 ONLY" in hint(LOADED + [USER, _said("पहले अपने बेस्ट-सेलर्स को 48-72 घंटे में रीस्टॉक करें।"), USER])
+    assert "show_call_summary" in hint(LOADED + [SIGNAL, CANCELS] + RECS)
+    assert "wait for the seller" in hint(LOADED + [_call("show_call_summary")])
+    assert "call end_call" in hint(LOADED + [_call("show_call_summary"), USER])
+    # every hint puts the seller first
+    assert "FIRST respond to what the seller just said" in hint(LOADED)
 
 
 def test_reply_is_cut_at_the_first_question():
@@ -199,7 +210,7 @@ def test_tool_names_are_never_spoken_even_when_split_across_chunks():
     assert spoken.split() == ["Update", "stock", "daily.", "Thanks."]
 
 
-def test_reply_stops_at_data_and_after_three_sentences():
+def test_reply_stops_at_data_and_is_capped():
     def spilled(_messages, _tools):
         yield {"text": 'Update stock daily. ({"key_issue": "stock-outs"}) We found the cause.'}
         yield {"tool_calls": []}
@@ -208,11 +219,17 @@ def test_reply_stops_at_data_and_after_three_sentences():
     assert out.strip() == "Update stock daily."
 
     def rambling(_messages, _tools):
-        yield {"text": "One. Two is 32.5 percent. Three. Four. Five."}
+        yield {"text": "One. Two is 32.5 percent. Three. Four. Five. Six. Seven. Eight. Nine."}
         yield {"tool_calls": []}
 
-    out = "".join(e["delta"] for e in free_agent.run_turn([{"role": "user", "content": "ok"}], llm=rambling) if e["type"] == "text")
-    assert out.strip() == "One. Two is 32.5 percent. Three."
+    def say(seller):
+        return "".join(e["delta"] for e in free_agent.run_turn([{"role": "user", "content": seller}], llm=rambling)
+                       if e["type"] == "text").strip()
+
+    assert say("ok") == "One. Two is 32.5 percent. Three. Four."
+    # the seller asked for an explanation: a longer answer is allowed
+    assert say("Can you explain how sponsored listings work") == "One. Two is 32.5 percent. Three. Four. Five. Six. Seven."
+
 
 
 def _closing(agent, seller, verdict):
@@ -256,3 +273,38 @@ def test_wrapping_up_offers_end_call_and_goodbye_hint():
     assert llm.offered == [["end_call"]]
     assert "goodbye" in llm.calls[0][-1]["content"]
     assert {"type": "tool", "name": "end_call", "args": {}} in events
+
+
+def test_general_answers_do_not_count_as_recommendations():
+    ads = _said("Sponsored listings are paid placements. They are worth it especially when you have just restocked "
+                "your best-sellers, because the extra visibility helps recover sales faster.")
+    assert _offered(LOADED + [SIGNAL, CANCELS, ads]) == []
+    assert "recommendation 1 ONLY" in free_agent.stage_hint(LOADED + [SIGNAL, CANCELS, ads, USER])
+
+
+def test_a_question_gets_an_answer_without_a_plan_item_attached():
+    ask = lambda text: free_agent.stage_hint(LOADED + [SIGNAL, {"role": "user", "content": text}])
+    for q in ["How do sponsored listings actually work?", "can you explain why stock-outs hurt ranking", "sponsored listing कैसे काम करती है?"]:
+        assert "then stop" in ask(q) and "recommendation" not in ask(q).replace("Do NOT add a recommendation", ""), q
+    # asking what to do IS a request for the plan
+    for q in ["ok so what should I do first?", "what next?", "ठीक है, तो मुझे क्या करना चाहिए?"]:
+        assert "next open item" in ask(q), q
+
+
+def test_an_empty_model_reply_is_retried_and_never_silent():
+    replies = iter(["", "Got it, that explains a lot."])
+
+    def llm(_messages, _tools):
+        text = next(replies)
+        if text:
+            yield {"text": text}
+        yield {"tool_calls": []}
+
+    out = "".join(e["delta"] for e in free_agent.run_turn([{"role": "user", "content": "my supplier was late"}], llm=llm) if e["type"] == "text")
+    assert out.strip() == "Got it, that explains a lot."
+
+    def always_empty(_messages, _tools):
+        yield {"tool_calls": []}
+
+    out = "".join(e["delta"] for e in free_agent.run_turn([{"role": "user", "content": "hmm"}], llm=always_empty) if e["type"] == "text")
+    assert "say it once more" in out
