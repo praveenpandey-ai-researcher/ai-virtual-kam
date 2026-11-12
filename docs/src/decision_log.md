@@ -148,3 +148,13 @@ Each entry: decision, why, alternatives considered, and how to explain it.
   - Kept: no invented account numbers, tools gated by stage, a question ends the turn, hang-up only on a real ending.
 - **Tested live:** a casual seller ("hey riya, how's your day going?", "my sales totally tanked"), an off-plan question about sponsored listings, "explain in detail why stock-outs hurt ranking", "what if I buy fake reviews?", then "what should I do first?". She chats, answers each on its own, declines the fake reviews, and returns to the plan only when asked. The standard cooperative flow still runs diagnosis, three recommendations, summary, goodbye.
 - **Trade-off:** More freedom means less predictability. Wording varies between runs (temperature 0.6), and the fixed order of the demo is no longer guaranteed if the seller wanders.
+
+## D24. ElevenLabs account chain before the free fallback
+- **Requirement:** ElevenLabs is the primary voice; the Groq/browser stack is only the last resort. With several ElevenLabs keys, a call should use key 1, then 2, 3, 4 as each runs out of credits, and only then fall back.
+- **Design:** `app/accounts.py` reads an ordered list (`ELEVENLABS_API_KEYS`, with agent ids aligned in `ELEVENLABS_AGENT_IDS`). `/api/session` walks the list and returns a call token from the first account that can take the call, plus the reasons the earlier ones were skipped. If none can, it returns the free mode.
+- **Two layers of detection, because one is not enough:**
+  1. *Before the call:* read the account's credit balance; under 300 credits it is skipped.
+  2. *During connect:* some keys are not allowed to read their balance, and a balance can run out between the check and the call. An exhausted account still issues a token but drops the call on connect. The browser detects "connected, then dropped before Riya spoke" and asks the server again with `after=<that account's position>`, so the chain continues from the next account instead of jumping straight to the fallback.
+- **Why agents are per account:** an ElevenLabs agent belongs to an account, not to a key, so `scripts/setup_agent.py` now creates/updates the same agent (prompt, tools, voice) on every account and saves the ids. An account whose key lacks the Agents permission is reported and skipped at runtime ("agent not set up").
+- **Secrets:** the keys live only in `.env` locally and as encrypted environment variables on the host; they are never in the repository, and the browser only receives short-lived call tokens.
+- **Tested:** unit tests with a faked probe cover: first account used, exhausted accounts skipped in order, accounts without an agent skipped, continuing after a dropped call, all exhausted → fallback, and reading the list from the environment.

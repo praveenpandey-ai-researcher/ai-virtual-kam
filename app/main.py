@@ -3,9 +3,11 @@
 Endpoints
   GET  /                 -> the voice call page
   GET  /api/diagnosis    -> seller metrics + computed diagnosis (drives the on-screen visuals)
-  GET  /api/session      -> decides the voice mode for this call:
-                              "elevenlabs" (primary): returns a short-lived WebRTC token
-                              "free" (fallback): browser speech + our Groq agent loop
+  GET  /api/session      -> decides the voice for this call:
+                              "elevenlabs" (primary): the first account in the chain that can take
+                                 the call; returns a short-lived WebRTC token
+                              "free" (fallback, when every account is exhausted): browser speech +
+                                 our Groq agent loop
   POST /api/free/turn    -> one seller turn in fallback mode, streamed as NDJSON events
   POST /api/free/transcribe -> speech-to-text for fallback mode (Whisper on Groq)
   GET  /api/health       -> liveness check
@@ -26,14 +28,13 @@ from pydantic import BaseModel, Field
 
 from app import agent_config as cfg
 from app import free_agent
+from app.accounts import elevenlabs_accounts, pick_account
 from app.diagnosis import diagnose, load_seller_data
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC = Path(__file__).parent / "static"
 load_dotenv(ROOT / ".env")
 
-ELEVEN = "https://api.elevenlabs.io/v1"
-MIN_ELEVENLABS_CREDITS = 300  # below this a call would die mid-sentence, so use the fallback instead
 
 app = FastAPI(title="Mini AI Voice KAM")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -60,47 +61,32 @@ def get_diagnosis() -> dict:
 
 
 # ---------------------------------------------------------------- voice mode selection
-async def _elevenlabs_token() -> tuple[str | None, str]:
-    """Returns (token, reason). token is None when ElevenLabs cannot take a call right now."""
-    key, agent_id = _env("ELEVENLABS_API_KEY"), _env("ELEVENLABS_AGENT_ID")
-    if not key or not agent_id:
-        return None, "ElevenLabs is not configured"
-    headers = {"xi-api-key": key}
-    try:
-        async with httpx.AsyncClient(timeout=10) as http:
-            sub = await http.get(f"{ELEVEN}/user/subscription", headers=headers)
-            if sub.status_code == 200:
-                s = sub.json()
-                remaining = (s.get("character_limit") or 0) - (s.get("character_count") or 0)
-                if remaining < MIN_ELEVENLABS_CREDITS:
-                    return None, f"ElevenLabs credits exhausted ({remaining} left)"
-            # (if the key cannot read the subscription we still try for a token)
-            tok = await http.get(f"{ELEVEN}/convai/conversation/token", params={"agent_id": agent_id}, headers=headers)
-            if tok.status_code != 200:
-                return None, f"ElevenLabs token request failed ({tok.status_code})"
-            return tok.json()["token"], "ok"
-    except httpx.HTTPError as e:
-        return None, f"ElevenLabs unreachable ({type(e).__name__})"
-
-
 @app.get("/api/session")
-async def create_session(mode: Literal["auto", "elevenlabs", "free"] = "auto") -> dict:
-    """Picks the voice mode. ElevenLabs is primary; the free stack is the automatic fallback.
+async def create_session(mode: Literal["auto", "elevenlabs", "free"] = "auto", after: int = -1) -> dict:
+    """Picks the voice for this call.
 
-    The ElevenLabs agent is private, so the browser never sees the API key: it gets a
-    short-lived conversation token from here.
+    Order: ElevenLabs account 1, 2, 3, ... (the first that can take the call), and only when every
+    account is unavailable, the free stack (browser speech + Groq).
+
+    `after` is the position of an account that has just failed in the browser (it issued a token but
+    dropped the call on connect, which is what an exhausted account does). The chain continues from
+    the next one. The ElevenLabs agents are private: the browser only ever gets a short-lived token.
     """
-    reason = "requested"
+    reasons: list[str] = ["requested"]
     if mode != "free":
-        token, reason = await _elevenlabs_token()
-        if token:
-            return {"mode": "elevenlabs", "conversation_token": token}
+        accounts = elevenlabs_accounts()
+        account, token, reasons = await pick_account(accounts, after)
+        if account and token:
+            return {"mode": "elevenlabs", "conversation_token": token, "account": account.index,
+                    "accounts": len(accounts), "skipped": reasons}
+        if not accounts:
+            reasons = ["ElevenLabs is not configured"]
         if mode == "elevenlabs":
-            raise HTTPException(503, reason)
+            raise HTTPException(503, "; ".join(reasons) or "no ElevenLabs account available")
     if not _env("GROQ_API_KEY"):
-        raise HTTPException(503, f"No voice service available: {reason}; fallback is not configured")
-    return {"mode": "free", "reason": reason, "first_message": cfg.FIRST_MESSAGE, "agent_name": cfg.KAM_NAME,
-            "seller_name": cfg.SELLER_NAME}
+        raise HTTPException(503, f"No voice service available: {'; '.join(reasons)}; fallback is not configured")
+    return {"mode": "free", "reason": "; ".join(reasons), "first_message": cfg.FIRST_MESSAGE,
+            "agent_name": cfg.KAM_NAME, "seller_name": cfg.SELLER_NAME}
 
 
 # ---------------------------------------------------------------- fallback agent turn

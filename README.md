@@ -32,7 +32,7 @@ cause (pricing) and estimates the ₹ impact. The LLM explains and discusses tho
 | Hearing and speaking | ElevenLabs real-time voice (WebRTC) | The browser's built-in speech recognition and speech synthesis |
 | LLM | Gemini 2.5 Flash (inside the agent) | Open models on Groq's free tier, rotated on rate limits |
 | Agent loop | Managed by ElevenLabs | Our own loop in `app/free_agent.py`, streamed to the browser |
-| When it is used | By default | When ElevenLabs has no credits, cannot issue a token, or hangs up on connect; or with `?mode=free` |
+| When it is used | By default. Several accounts can be chained: a call uses the first with credits and moves down the list as each runs out | Only when every ElevenLabs account is out of credits or unreachable; or with `?mode=free` |
 
 Both modes share the system prompt, the tools, the diagnosis engine and the on-screen experience, so the
 advice is identical. The conversation is seller-led: the agent answers whatever the seller asks, in the
@@ -69,8 +69,8 @@ Requires Python 3.10+ and an [ElevenLabs](https://elevenlabs.io) API key with Ag
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env              # add ELEVENLABS_API_KEY and/or GROQ_API_KEY
-python scripts/setup_agent.py     # creates the agent + tools, saves ELEVENLABS_AGENT_ID to .env
+cp .env.example .env              # add ELEVENLABS_API_KEYS (one or more) and/or GROQ_API_KEY
+python scripts/setup_agent.py     # creates the agent + tools on every account, saves ELEVENLABS_AGENT_IDS to .env
 uvicorn app.main:app --port 8000
 ```
 
@@ -84,6 +84,7 @@ To preview the visuals without a call, open http://localhost:8000/?demo=1.
 | `app/diagnosis.py` | Diagnosis engine: metrics, rules, ranked findings, recommendations |
 | `app/agent_config.py` | Agent persona, system prompt, tools, voice and LLM (configuration as code) |
 | `app/main.py` | FastAPI: page, diagnosis endpoint, voice-mode selection, fallback turn endpoint |
+| `app/accounts.py` | ElevenLabs account chain: picks the first account that can take a call |
 | `app/free_agent.py` | Fallback agent loop on Groq: model rotation, stage guard rails, streaming |
 | `app/static/` | Voice call UI: live transcript, conversation-driven data panel |
 | `app/data/seller_data.json` | Sample seller data from the brief, plus labelled mock assumptions |

@@ -522,8 +522,11 @@ function callStarted(modeLabel) {
   startVoiceLoop();
 }
 
-async function getSession(mode) {
-  const res = await fetch(`/api/session${mode ? `?mode=${encodeURIComponent(mode)}` : ""}`);
+async function getSession(mode, after) {
+  const q = new URLSearchParams();
+  if (mode) q.set("mode", mode);
+  if (after !== undefined) q.set("after", after);   // continue the account chain after this position
+  const res = await fetch(`/api/session${q.size ? `?${q}` : ""}`);
   if (!res.ok) throw new Error((await res.json()).detail || "Could not start a session");
   return res.json();
 }
@@ -572,14 +575,19 @@ async function startElevenLabs(info) {
     },
     onDisconnect: async () => {
       dead = true;
-      // Connected but hung up before saying anything = the agent is unavailable (e.g. out of credits).
-      // Switch to the free fallback instead of leaving the seller with a dead call.
+      // Connected but hung up before saying anything = this account cannot take the call (out of
+      // credits). Move down the chain: the next ElevenLabs account, or the free fallback after the last.
       if (!heardAgent && !userEnded) {
         call = null;
-        addMessage("event", "Premium voice unavailable, switching to backup voice…");
         try {
-          const mic = await navigator.mediaDevices.getUserMedia(MIC);
-          await startFree(await getSession("free"), mic);
+          const next = await getSession(FORCE_MODE === "elevenlabs" ? "elevenlabs" : null, info.account);
+          if (next.mode === "elevenlabs") {
+            addMessage("event", "Line busy, reconnecting…");
+            await startElevenLabs(next);
+          } else {
+            addMessage("event", "Premium voice unavailable, switching to backup voice…");
+            await startFree(next, await navigator.mediaDevices.getUserMedia(MIC));
+          }
         } catch (err) { showStartError(err); }
         return;
       }

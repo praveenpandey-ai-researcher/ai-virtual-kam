@@ -12,10 +12,11 @@ from pathlib import Path
 
 import httpx
 import websockets
-from dotenv import dotenv_values
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from app.accounts import elevenlabs_accounts  # noqa: E402
 from app.diagnosis import diagnose, load_seller_data  # noqa: E402
 
 SCENARIOS = {
@@ -55,10 +56,13 @@ def answer_tool(name: str, params: dict) -> str:
 
 
 async def run(turns: list[str]) -> None:
-    env = dotenv_values(ROOT / ".env")
+    load_dotenv(ROOT / ".env")
+    acc = next((a for a in elevenlabs_accounts() if a.agent_id), None)
+    if not acc:
+        sys.exit("No ElevenLabs account with an agent. Run scripts/setup_agent.py first.")
+    print(f"(using account {acc.index + 1})")
     r = httpx.get("https://api.elevenlabs.io/v1/convai/conversation/get-signed-url",
-                  params={"agent_id": env["ELEVENLABS_AGENT_ID"]},
-                  headers={"xi-api-key": env["ELEVENLABS_API_KEY"]}, timeout=20)
+                  params={"agent_id": acc.agent_id}, headers={"xi-api-key": acc.key}, timeout=20)
     r.raise_for_status()
 
     async with websockets.connect(r.json()["signed_url"], max_size=None) as ws:
